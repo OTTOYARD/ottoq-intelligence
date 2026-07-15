@@ -15,14 +15,24 @@ Every optimizer output is advisory to the twin's deterministic safety shield.
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.optimizers.energy_mpc import BessState, optimize_energy
 
 app = FastAPI(title="OTTO-Q Intelligence Service", version="0.1.0")
+
+# Shared-secret bearer auth. Set OTTOQ_API_TOKEN in the container env; the twin sends
+# it as `Authorization: Bearer <token>`. If unset (local dev), auth is open.
+_API_TOKEN = os.environ.get("OTTOQ_API_TOKEN")
+
+
+def require_token(authorization: str = Header(default="")):
+    if _API_TOKEN and authorization != f"Bearer {_API_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 class BessIn(BaseModel):
@@ -55,7 +65,7 @@ def health():
     return {"ok": True, "service": "ottoq-intelligence", "optimizers": ["energy_mpc"]}
 
 
-@app.post("/optimize/energy")
+@app.post("/optimize/energy", dependencies=[Depends(require_token)])
 def optimize_energy_endpoint(req: EnergyOptIn):
     res = optimize_energy(
         load_kw=req.load_kw,
