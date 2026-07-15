@@ -52,6 +52,8 @@ class EnergyOptResult:
     demand_cost_usd: float
     energy_cost_usd: float
     degradation_usd: float
+    dr_violation_kwh: float             # energy drawn above the DR/feeder cap (0 if honored)
+    total_bill_usd: float               # demand + energy + degradation (the economic bottom line)
     status: str
     solver: str
 
@@ -82,6 +84,8 @@ def optimize_energy(
     end_soc_min_frac: Optional[float] = None,  # optionally require the battery re-charged by horizon end
     allow_export: bool = False,
     uncertainty_kw: Optional[List[float]] = None,  # robust band per step (from FR-2 forecaster)
+    grid_cap_kw: Optional[List[float]] = None,     # demand-response / feeder ceiling per step (None = no cap)
+    dr_penalty_usd_per_kwh: float = 5.0,           # penalty for drawing above the DR/feeder cap
     solver_msg: bool = False,
 ) -> EnergyOptResult:
     T = len(load_kw)
@@ -99,6 +103,10 @@ def optimize_energy(
     soc = [pulp.LpVariable(f"soc_{t}", floor, ceil) for t in range(T)]
     grid = [pulp.LpVariable(f"grid_{t}", (None if allow_export else 0)) for t in range(T)]
     peak = pulp.LpVariable("peak", lowBound=max(0.0, billing_period_peak_kw))
+    # DR/feeder cap as a SOFT constraint: viol[t] = grid drawn above the cap. Soft (not hard)
+    # so the LP always returns the least-violating schedule when the cap is physically
+    # infeasible, and the twin never has to hold vehicles to honor a grid limit.
+    viol = [pulp.LpVariable(f"viol_{t}", 0) for t in range(T)]
 
     for t in range(T):
         # site energy balance: grid import covers load minus solar minus battery discharge plus charge
@@ -107,6 +115,9 @@ def optimize_energy(
         prob += peak >= grid[t] + uncertainty_kw[t], f"peak_{t}"
         prev = bess.soc_kwh if t == 0 else soc[t - 1]
         prob += soc[t] == prev + (chg[t] * bess.eff_charge - dis[t] / bess.eff_discharge) * tick_hours, f"soc_{t}"
+        cap_t = None if grid_cap_kw is None else grid_cap_kw[t]
+        if cap_t is not None and cap_t < float("inf"):
+            prob += grid[t] - viol[t] <= cap_t, f"drcap_{t}"
 
     if end_soc_min_frac is not None:
         prob += soc[T - 1] >= end_soc_min_frac * bess.capacity_kwh, "end_soc"
@@ -114,7 +125,8 @@ def optimize_energy(
     demand_cost = demand_charge_usd_per_kw * peak
     energy_cost = pulp.lpSum(energy_price_usd_per_kwh[t] * grid[t] * tick_hours for t in range(T))
     degradation = pulp.lpSum(bess.degradation_usd_per_kwh * (dis[t] + chg[t]) * tick_hours for t in range(T))
-    prob += demand_cost + energy_cost + degradation
+    dr_cost = pulp.lpSum(dr_penalty_usd_per_kwh * viol[t] * tick_hours for t in range(T))
+    prob += demand_cost + energy_cost + degradation + dr_cost
 
     solver, solver_name = _pick_solver(msg=solver_msg)
     prob.solve(solver)
@@ -124,6 +136,11 @@ def optimize_energy(
     grid_v = [float(grid[t].value() or 0.0) for t in range(T)]
     soc_v = [float(soc[t].value() or 0.0) for t in range(T)]
     peak_v = float(peak.value() or 0.0)
+    dr_viol_kwh = float(sum((viol[t].value() or 0.0) * tick_hours for t in range(T)))
+
+    demand_usd = demand_charge_usd_per_kw * peak_v
+    energy_usd = float(sum(energy_price_usd_per_kwh[t] * grid_v[t] * tick_hours for t in range(T)))
+    degr_usd = float(sum(bess.degradation_usd_per_kwh * (abs(setpoint[t])) * tick_hours for t in range(T)))
 
     return EnergyOptResult(
         bess_setpoint_kw=setpoint,
@@ -131,9 +148,11 @@ def optimize_energy(
         soc_kwh=soc_v,
         predicted_peak_kw=peak_v,
         objective_usd=float(pulp.value(prob.objective) or 0.0),
-        demand_cost_usd=demand_charge_usd_per_kw * peak_v,
-        energy_cost_usd=float(sum(energy_price_usd_per_kwh[t] * grid_v[t] * tick_hours for t in range(T))),
-        degradation_usd=float(sum(bess.degradation_usd_per_kwh * (abs(setpoint[t])) * tick_hours for t in range(T))),
+        demand_cost_usd=demand_usd,
+        energy_cost_usd=energy_usd,
+        degradation_usd=degr_usd,
+        dr_violation_kwh=dr_viol_kwh,
+        total_bill_usd=demand_usd + energy_usd + degr_usd,
         status=status,
         solver=solver_name,
     )
