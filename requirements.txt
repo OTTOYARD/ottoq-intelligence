@@ -1,0 +1,8 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pulp>=2.8          # LP/MILP modeling; ships CBC, prefers HiGHS if present
+highspy>=1.7       # HiGHS solver (fast, modern, OSS)
+numpy>=1.26
+# FR-2 (GPU tier): neuralforecast, torch  — installed in the GPU image only
+# FR-3: cuopt client / requests  |  FR-4: openai-compatible NIM client
