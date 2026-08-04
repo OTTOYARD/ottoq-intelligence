@@ -58,6 +58,8 @@ class EnergyOptIn(BaseModel):
     end_soc_min_frac: Optional[float] = None
     allow_export: bool = False
     uncertainty_kw: Optional[List[float]] = None
+    grid_cap_kw: Optional[List[float]] = None       # demand-response / feeder ceiling per step
+    dr_penalty_usd_per_kwh: float = 5.0
 
 
 @app.get("/health")
@@ -78,6 +80,8 @@ def optimize_energy_endpoint(req: EnergyOptIn):
         end_soc_min_frac=req.end_soc_min_frac,
         allow_export=req.allow_export,
         uncertainty_kw=req.uncertainty_kw,
+        grid_cap_kw=req.grid_cap_kw,
+        dr_penalty_usd_per_kwh=req.dr_penalty_usd_per_kwh,
     )
     return res.__dict__
 
