@@ -92,11 +92,16 @@ existing is not evidence it is unmerged — check
 (`/orgs/OTTOYARD/...` returns 404 — use `/user/repos`). And GitHub **rejects pushes authored as
 `chase@ottoyard.com`** — commit as a noreply identity.
 
-**The one database that matters is `gxdrcyphqjzjsuhxuqtg`.** ⚠️ **Every `supabase/config.toml` in
-every OTTOYARD repo points somewhere else** — at dead refs (`hfjaofyfxsyniohdfacg`,
-`odhpbdhnpcrjeaxvbrzd`), at OrchestrAV's legacy database (`ycsisvozzgmisboumfqc`), or at a
-placeholder. The real ref is hardcoded in client code instead. **Pass
-`--project-ref gxdrcyphqjzjsuhxuqtg` explicitly to any Supabase CLI command that writes.**
+**Three Supabase projects — the engine is `gxdrcyphqjzjsuhxuqtg` (otto-q-core, us-east-1).**
+`ycsisvozzgmisboumfqc` is the **OTTOYARD MVP** (us-east-2): the original demo backend, OrchestrAV's
+auth/billing/retail (`ottoq_ps_*`) home, and the live intelligence pipeline (`intelligence_events`,
+written every ≤3 min by its own pg_cron + `intelligence-*` edge functions) — active, never the
+engine. `sovyxwtrqfmizelrammm` (Fleet Dashboard) is INACTIVE with zero live callers. ⚠️ **Every
+`supabase/config.toml` in every OTTOYARD repo points somewhere else** — at dead refs
+(`hfjaofyfxsyniohdfacg`, `odhpbdhnpcrjeaxvbrzd`), at the MVP, or at a placeholder. The real ref is
+hardcoded in client code instead. **Pass `--project-ref gxdrcyphqjzjsuhxuqtg` explicitly to any
+Supabase CLI command that writes.** (DB labels reconciled 2026-08-18 by Run 1 C1 — see
+`SYSTEM_TOPOLOGY.md` in `otto-q-core`.)
 
 **Never disable pg_cron job 12** (`ottoq-demo-metronome`). It **is** the simulation run engine.
 Disabling it stops every run while everything still looks green.
