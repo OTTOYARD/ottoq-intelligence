@@ -1,8 +1,10 @@
 # OTTO-Q Intelligence Service
 
-The frontier optimization + ML backbone for OTTO-Q robotaxi-depot orchestration.
-Hosts the real optimizers and learned models that **cannot** live in Postgres, and
-that the twin / Supabase edge-functions call over HTTP.
+The optimization + ML sidecar for OTTO-Q robotaxi-depot orchestration: it hosts
+optimizers and models that cannot live in Postgres, called by the twin / Supabase
+edge-functions over HTTP. Honest status: the energy-MPC layer is real and certified
+below; several other layers are stubs (see the layer table), and production currently
+runs with `energy_mpc_follow=0` — this service is advisory input, not the live backbone.
 
 **Doctrine:** *model proposes → optimizer disposes → shield guarantees → loop learns.*
 Every output here is **advisory** to the twin's deterministic safety shield (vehicles
@@ -27,11 +29,16 @@ throttling a charger).
 peak no_bess   : 2020 kW  $43,996/mo
 peak heuristic : 1250 kW  $27,225/mo   (current live cert_03 rule)
 peak MPC       :  771 kW  $16,786/mo
-MPC shave vs heuristic: 38.3%   (~$125k/yr ADDITIONAL alpha per depot)
+MPC shave vs naive heuristic: 38.3%
 ```
 
-The MPC beats the reactive heuristic because it uses full-horizon foresight to flatten
-the entire wave rather than greedily clipping to a fixed target.
+**Do not quote the 38.3% (or a $/yr figure derived from it) externally.** Per AGENTS.md:
+that comparison is against the naive fixed-target heuristic, and an adversarial
+refutation showed a well-tuned reserve-aware reactive controller matches the LP to the
+penny (branch `fr1b-energy-optimizer-certs`, `cert/reactive_reserve_matches_lp.py`).
+The honest claim is: full-horizon MPC and a well-tuned reactive controller both flatten
+the wave far below the naive rule; MPC's remaining edge must be established against that
+tuned baseline before any number ships.
 
 ## Run locally
 
