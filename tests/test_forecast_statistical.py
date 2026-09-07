@@ -35,10 +35,28 @@ FORBIDDEN_IDENTS = [
     "ottoq_stall_bookings", "ottoq_rule_evaluations", "bess_snapshots",
     "vehicle_state_log", "ottoq_events", "sim_run_id", "data_source",
 ]
-FORBIDDEN_IMPORTS = [
-    "sqlalchemy", "supabase", "psycopg", "psycopg2", "requests", "httpx",
-    "aiohttp", "boto3", "asyncpg", "pymongo", "redis",
-]
+
+#: THE IMPORT GUARD IS AN ALLOWLIST, AND THAT IS THE WHOLE POINT.
+#: It used to be a blacklist of eleven third-party names (sqlalchemy, supabase,
+#: psycopg2, requests, httpx, aiohttp, boto3, asyncpg, pymongo, redis). Every
+#: other route to a socket or a database walked straight past it: urllib.request,
+#: socket, http.client and ftplib are STDLIB and were not on the list; sqlite3 is
+#: a database that was not on the list; subprocess can shell out to psql; and
+#: os.environ can carry a DSN. A blacklist can only forbid what its author
+#: thought of, and the thing being guarded here -- that the forecast cannot see
+#: OTTO-Q's own decisions -- is exactly the kind of claim that must not depend on
+#: an author's imagination.
+#: An allowlist inverts that: a new import is refused until somebody adds it here
+#: deliberately, in a diff a reviewer sees.
+ALLOWED_IMPORTS = {
+    "__future__", "math", "json", "hashlib", "pathlib", "dataclasses",
+    "typing", "collections", "itertools", "functools", "enum", "decimal",
+    "app",  # only app.forecasters.* — enforced separately below
+}
+
+#: Ways to reach a module without an import statement. All are ast.Call nodes,
+#: so the import guard above never saw them.
+FORBIDDEN_CALLS = {"__import__", "eval", "exec", "compile", "open"}
 
 
 def _docstring_node_ids(tree):
@@ -58,33 +76,127 @@ def _docstring_node_ids(tree):
     return ids
 
 
+def _package_sources():
+    """Every .py in the package, RECURSIVELY.
+
+    Both guards used PKG.glob("*.py"), which is top-level only. A module in a
+    subdirectory of app/forecasters/ was never parsed at all: it could import a
+    database driver, carry a DSN, name a forbidden table and feed a
+    decision-derived number into the forecast, and statistical.py could import it
+    with a plain `from app.forecasters.sub import x` that the ImportFrom branch
+    waved through as an `app` import. rglob closes that.
+    """
+    return sorted(PKG.rglob("*.py"))
+
+
 def test_contamination_guard_no_db_or_network_import():
-    for py in PKG.glob("*.py"):
+    for py in _package_sources():
         tree = ast.parse(py.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert a.name.split(".")[0] not in FORBIDDEN_IMPORTS, \
-                        f"T1 FAIL: {py.name} imports {a.name}"
+                    root = a.name.split(".")[0]
+                    assert root in ALLOWED_IMPORTS, \
+                        f"T1 FAIL: {py.name} imports {a.name} (not on the allowlist)"
+                    assert not a.name.startswith("app.") or a.name.startswith("app.forecasters"), \
+                        f"T1 FAIL: {py.name} imports {a.name} from outside app.forecasters"
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
-                assert mod.split(".")[0] not in FORBIDDEN_IMPORTS, \
-                    f"T1 FAIL: {py.name} imports from {mod}"
+                #: a relative import (level > 0) stays inside the package
+                if node.level:
+                    continue
+                root = mod.split(".")[0]
+                assert root in ALLOWED_IMPORTS, \
+                    f"T1 FAIL: {py.name} imports from {mod} (not on the allowlist)"
+                assert not mod.startswith("app.") or mod.startswith("app.forecasters"), \
+                    f"T1 FAIL: {py.name} imports from {mod}, outside app.forecasters"
+
+
+def test_contamination_guard_no_dynamic_import_or_eval():
+    """__import__('psycopg2') is a Call, not an Import, and the old guard was blind to it."""
+    for py in _package_sources():
+        tree = ast.parse(py.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (
+                fn.attr if isinstance(fn, ast.Attribute) else None)
+            assert name not in FORBIDDEN_CALLS, \
+                f"T1 FAIL: {py.name} calls {name}() — a route to code or files the import guard cannot see"
+            if isinstance(fn, ast.Attribute) and name == "import_module":
+                raise AssertionError(f"T1 FAIL: {py.name} calls importlib.import_module()")
+
+
+def test_contamination_guard_the_whole_imported_graph_stays_in_the_package():
+    """Import the package for real and check what THAT import dragged in.
+
+    The AST guards read files; this one reads sys.modules. A first-party module
+    outside app/forecasters that itself imports a database driver would satisfy
+    every textual check and still put the driver in the process. Measured as a
+    before/after diff around the import, so the test file, pytest and the stdlib
+    already loaded are not mistaken for the package's own dependencies.
+    """
+    import sys
+    import importlib
+    repo = PKG.parents[1].resolve()
+    pkg = PKG.resolve()
+    for m in [k for k in sys.modules if k == "app" or k.startswith("app.")]:
+        del sys.modules[m]
+    before = set(sys.modules)
+    importlib.import_module("app.forecasters")
+    pulled_in = set(sys.modules) - before
+
+    offenders = []
+    for name in sorted(pulled_in):
+        f = getattr(sys.modules[name], "__file__", None)
+        if not f:
+            continue
+        fp = Path(f).resolve()
+        try:
+            fp.relative_to(repo)
+        except ValueError:
+            continue  # stdlib / site-packages: the allowlist above governs these
+        #: app/__init__.py is the parent package Python must import to reach
+        #: app.forecasters at all; it is empty and is allowed.
+        if fp == (pkg.parent / "__init__.py"):
+            continue
+        if pkg not in fp.parents and fp.parent != pkg:
+            offenders.append(name)
+    assert not offenders, \
+        f"T1 FAIL: importing app.forecasters pulled in first-party modules outside it: {offenders}"
 
 
 def test_contamination_guard_no_sim_identifiers_in_code():
-    for py in PKG.glob("*.py"):
+    """Match the forbidden names wherever they can hide, not only as bare Names.
+
+    The scan used to look at ast.Name and whole string Constants only, so an
+    attribute (`db.ottoq_decisions`), a keyword argument (`table=...`), a
+    function or class NAME, a bytes literal, and an f-string piece all slipped
+    through. Every node that can carry an identifier is now checked.
+    """
+    for py in _package_sources():
         tree = ast.parse(py.read_text())
         skip = _docstring_node_ids(tree)
         for node in ast.walk(tree):
             if id(node) in skip:
                 continue
+            texts = []
             if isinstance(node, ast.Name):
-                assert node.id not in FORBIDDEN_IDENTS, \
-                    f"T1 FAIL: {py.name} references identifier {node.id!r}"
+                texts.append(node.id)
+            elif isinstance(node, ast.Attribute):
+                texts.append(node.attr)
+            elif isinstance(node, ast.keyword) and node.arg:
+                texts.append(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                texts.append(node.name)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                assert not any(w in node.value for w in FORBIDDEN_IDENTS), \
-                    f"T1 FAIL: {py.name} carries string {node.value!r}"
+                texts.append(node.value)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+                texts.append(node.value.decode("utf-8", "ignore"))
+            for t in texts:
+                assert not any(w in t for w in FORBIDDEN_IDENTS), \
+                    f"T1 FAIL: {py.name} carries {t!r}"
 
 
 def test_contamination_guard_snapshot_is_priors_only():
@@ -178,10 +290,53 @@ def test_load_base_follows_eia_shape_and_ev_is_positive():
 # ---------------------------------------------------------------------------
 
 def test_snapshot_fingerprint_verifies():
+    """The loader must REFUSE a tampered snapshot, not merely carry a hash.
+
+    This test used to read `raw["manifest"]["fingerprint_md5"]` and compare it to
+    `PRIORS.fingerprint` — which load_priors() had just assigned FROM that very
+    field. It compared the manifest to itself. It passed with the loader's
+    verification deleted, and it passed on a snapshot whose numbers had been
+    edited, which is precisely the case it was named for.
+
+    The real claim is behavioural: change a prior and the loader raises. So the
+    test changes one and asserts it does.
+    """
     assert PRIORS.fingerprint, "T5 FAIL: no fingerprint"
     raw = json.loads((PKG / "priors_snapshot.json").read_text())
-    assert raw["manifest"]["fingerprint_md5"] == PRIORS.fingerprint, \
-        "T5 FAIL: manifest fingerprint differs from loaded priors"
+    assert raw["manifest"]["fingerprint_md5"] == PRIORS.fingerprint
+
+    import shutil, tempfile
+    from app.forecasters.priors import load_priors as _load
+    with tempfile.TemporaryDirectory() as d:
+        tampered = Path(d) / "priors_snapshot.json"
+        doc = json.loads((PKG / "priors_snapshot.json").read_text())
+        #: move ONE number and leave the manifest hash untouched — the exact
+        #: shape of a quietly edited prior set
+        ds = sorted(doc["distributions"])[0]
+        metric = sorted(doc["distributions"][ds])[0]
+        grid = doc["distributions"][ds][metric]["quantile_grid"]
+        grid[0] = float(grid[0]) + 1.0
+        tampered.write_text(json.dumps(doc))
+        try:
+            _load(tampered)
+        except ValueError as e:
+            assert "fingerprint mismatch" in str(e), f"T5 FAIL: wrong refusal: {e}"
+        else:
+            raise AssertionError(
+                "T5 FAIL: the loader accepted a snapshot whose numbers do not "
+                "match its own fingerprint")
+
+        #: and a snapshot that is merely truncated must not sail through either
+        short = Path(d) / "short.json"
+        doc2 = json.loads((PKG / "priors_snapshot.json").read_text())
+        doc2["distributions"].pop(sorted(doc2["distributions"])[0])  # drop a whole dataset
+        short.write_text(json.dumps(doc2))
+        try:
+            _load(short)
+        except (ValueError, KeyError):
+            pass
+        else:
+            raise AssertionError("T5 FAIL: the loader accepted a truncated snapshot")
 
 
 if __name__ == "__main__":
