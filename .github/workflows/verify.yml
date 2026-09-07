@@ -1,0 +1,22 @@
+name: verify
+# THIS REPO HAD NO CI AT ALL until 2026-09-07. Every guard in it -- the
+# contamination guard that is the whole reason the forecast can be trusted,
+# and the bearer-auth guard on a service the deploy exposes to 0.0.0.0/0 --
+# ran only when somebody remembered to type pytest. A guard nothing runs is
+# indistinguishable from a guard that does not exist.
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest
+      - name: Test suite (forecast priors, contamination guard, energy MPC, auth)
+        run: python3 -m pytest -q

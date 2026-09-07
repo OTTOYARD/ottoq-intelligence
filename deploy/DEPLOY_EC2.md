@@ -12,7 +12,12 @@ recommended App Runner replacement — ask me and I'll give those steps instead.
 - **Key pair:** create/choose one (you'll SSH with it)
 - **Network / Security group → allow:**
   - SSH (22) from **My IP**
-  - Custom TCP **8080** from **Anywhere (0.0.0.0/0)**  *(the twin calls this; it's protected by a bearer token below)*
+  - Custom TCP **8080** from **Anywhere (0.0.0.0/0)**  *(the twin calls this; it is protected by the
+    bearer token below — and since 2026-09-07 the service REFUSES every request with 503 when
+    `OTTOQ_API_TOKEN` is unset, rather than serving them. Before that, a missing variable looked
+    exactly like a correct deployment and this line was not true.)*
+  - Prefer narrowing this to the Supabase edge egress range, or fronting the box with HTTPS, rather
+    than relying on one shared secret over plaintext HTTP. Open item for the founder.
 - Launch. Note the **Public IPv4 address**.
 
 ## 2. Install + run (SSH in, 5 commands)
