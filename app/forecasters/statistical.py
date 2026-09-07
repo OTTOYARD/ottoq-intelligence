@@ -145,6 +145,18 @@ def forecast_arrivals(priors: Priors, *, fleet_size: int, turns_per_day: float,
             "hour_index": h,
             "hour_of_day": hod,
             "expected_arrivals": round(lam, 3),
+            #: THE CLIMATOLOGY THIS HOUR WAS EXPECTED TO BRING, emitted beside
+            #: the nowcast. Here they are IDENTICAL, and that is the honest
+            #: statement about this forecaster: it is pure climatology
+            #: (mean_hourly x hourly_shape x dow_mult) with no live observation
+            #: and no perturbation, so it can never report a deviation from
+            #: itself. Consumers that test for a surge need both numbers --
+            #: comparing the window against a flat daily mean instead asks "is
+            #: this above the daily average?", which the diurnal shape already
+            #: answers for every hour and which the shape's own peak (1.91x)
+            #: cannot push past a 2.0 threshold. A nowcasting forecaster raises
+            #: expected_arrivals above this field; that gap is the signal.
+            "baseline_arrivals": round(lam, 3),
             "p10": _poisson_quantile(lam, 0.10),
             "p50": _poisson_quantile(lam, 0.50),
             "p90": _poisson_quantile(lam, 0.90),

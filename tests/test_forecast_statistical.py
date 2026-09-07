@@ -256,6 +256,43 @@ def test_arrivals_peak_in_evening_and_dow_scales_total():
     assert by_hod[17] > by_hod[5], "T4 FAIL: arrival shape has no evening peak"
 
 
+def test_every_arrivals_hour_carries_its_own_climatological_baseline():
+    """The consumer needs two numbers to call a surge: what it expects now, and
+    what this hour was expected to bring. Emitting only the first forced the
+    consumer to reconstruct the second from a flat daily mean — and against a
+    diurnal shape that comparison is unreachable by construction, so
+    demand_surge could never fire.
+
+    This forecaster is pure climatology, so the two are equal here and it
+    correctly never reports a surge. The field exists so that fact is visible
+    and so a nowcasting forecaster has somewhere to put the real number.
+    """
+    a = forecast_arrivals(PRIORS, fleet_size=118, turns_per_day=2.5, dow=0)
+    for h in a.hours:
+        assert "baseline_arrivals" in h, f"T4 FAIL: no baseline at {h}"
+        assert h["baseline_arrivals"] == h["expected_arrivals"], (
+            "T4 FAIL: this forecaster has no live observation and no "
+            "perturbation, so its nowcast IS its climatology")
+
+
+def test_the_diurnal_shape_cannot_reach_the_surge_threshold_against_a_flat_mean():
+    """Why the baseline field had to exist, measured on the SHIPPED priors.
+
+    demand_surge's threshold is 2.0x. Against a flat daily mean the achievable
+    ratio is bounded by the shape's own busiest window times the largest
+    day-of-week multiplier — 1.5956 x 1.1980 = 1.9115. Below 2.0, for every
+    site, hour and weekday, and scale-invariant so no fleet size rescues it.
+    """
+    shape = PRIORS.profiles["nyc_tlc"]["hourly_arrival_rate"].data
+    dow = PRIORS.profiles["nyc_tlc"]["dow_demand_multiplier"].data
+    W = 3
+    best = max(sum(float(shape[str((start + i) % 24)]) for i in range(W))
+               for start in range(24))
+    ceiling = (best / W) * max(float(v) for v in dow.values())
+    assert round(ceiling, 4) == 1.9115, f"T4 FAIL: ceiling moved to {ceiling}"
+    assert ceiling < 2.0
+
+
 def test_quantile_ordering_is_monotonic():
     a = forecast_arrivals(PRIORS, fleet_size=118, turns_per_day=2.5)
     for h in a.hours:
