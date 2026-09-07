@@ -22,6 +22,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.optimizers.energy_mpc import BessState, optimize_energy
+from app.forecasters.priors import load_priors
+from app.forecasters.statistical import forecast
 
 app = FastAPI(title="OTTO-Q Intelligence Service", version="0.1.0")
 
@@ -86,10 +88,39 @@ def optimize_energy_endpoint(req: EnergyOptIn):
     return res.__dict__
 
 
-@app.post("/forecast")
-def forecast_stub():
-    # FR-2: replace with TFT/NHITS probabilistic forecaster served from the GPU tier.
-    return {"status": "not_implemented", "note": "FR-2 learned forecaster pending"}
+class ForecastIn(BaseModel):
+    fleet_size: int = Field(..., description="number of vehicles in the depot fleet")
+    turns_per_day: float = Field(..., description="expected returns per vehicle per day")
+    base_load_kw: float = Field(..., description="site non-EV baseline load at mean")
+    ev_daily_sessions: float = Field(..., description="expected EV charging sessions per day")
+    departure_soc_pct: float = Field(..., description="typical SoC at departure (%)")
+    target_soc_pct: float = Field(..., description="target SoC to restore vehicles to (%)")
+    battery_kwh: float = Field(..., description="representative battery capacity (kWh)")
+    horizon_hours: int = 24
+    start_hour: int = Field(0, ge=0, le=23, description="hour of day the horizon begins")
+    dow: int = Field(0, ge=0, le=6, description="0=Monday .. 6=Sunday")
+
+
+@app.post("/forecast", dependencies=[Depends(require_token)])
+def forecast_endpoint(req: ForecastIn):
+    # FR-2: statistical, demand-side forecast. Built on the real-world
+    # calibration priors (ACN-Data, NYC TLC, EIA, NREL), never on sim output.
+    # The neural (TFT/NHITS) forecaster is a later GPU-tier upgrade behind the
+    # same interface — see requirements.txt and app/forecasters/statistical.py.
+    priors = load_priors()
+    return forecast(
+        priors,
+        fleet_size=req.fleet_size,
+        turns_per_day=req.turns_per_day,
+        base_load_kw=req.base_load_kw,
+        ev_daily_sessions=req.ev_daily_sessions,
+        departure_soc_pct=req.departure_soc_pct,
+        target_soc_pct=req.target_soc_pct,
+        battery_kwh=req.battery_kwh,
+        horizon_hours=req.horizon_hours,
+        start_hour=req.start_hour,
+        dow=req.dow,
+    )
 
 
 @app.post("/assign")
