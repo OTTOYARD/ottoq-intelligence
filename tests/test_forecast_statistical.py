@@ -13,6 +13,8 @@ import json
 import math
 from pathlib import Path
 
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from app.forecasters.priors import (
@@ -60,6 +62,15 @@ FORBIDDEN_IDENTS = [
 ALLOWED_IMPORTS = {
     "__future__", "math", "json", "hashlib", "pathlib", "dataclasses",
     "typing", "collections", "itertools", "functools", "enum", "decimal",
+    #: datetime + zoneinfo: added 2026-09-08 for finding L-35. Every hourly_24
+    #: prior declares the timezone its hour keys are bucketed in, and the
+    #: forecast converts each shape into the SITE's clock before combining
+    #: them — which needs real zone offsets, not a hand-rolled table. Both are
+    #: stdlib, pure, offline: zoneinfo reads the system tzdata files and opens
+    #: no socket, so neither weakens what this guard exists to prove (the
+    #: forecast cannot reach a database or the network, and therefore cannot
+    #: learn from OTTO-Q's own decisions).
+    "datetime", "zoneinfo",
     "app",  # only app.forecasters.* — enforced separately below
 }
 
@@ -358,10 +369,17 @@ def test_soc_return_drops_below_departure_and_need_restores_target():
     assert s.return_soc["p50"] < s.departure_soc_pct, "T4 FAIL: SoC did not drop"
     assert s.return_soc["p50"] >= 0.0, "T4 FAIL: SoC went negative"
     assert s.fleet_energy_need_kwh["p50"] > 0, "T4 FAIL: fleet energy need is zero"
-    # fleet need = per-vehicle need x fleet size, within per-vehicle rounding (0.1)
-    assert abs(s.fleet_energy_need_kwh["p50"]
-               - s.energy_need_per_vehicle_kwh["p50"] * 100) < 0.1 * 100 + 0.1, \
-        "T4 FAIL: fleet need does not scale linearly with fleet size"
+    #: THE OLD ASSERTION PINNED THE BUG (finding L-36): it required the fleet
+    #: band to be the per-vehicle band times fleet_size, which is exactly the
+    #: error -- "every vehicle simultaneously at its own tail", an event of
+    #: probability ~0, rather than the quantile of the fleet TOTAL. What must
+    #: hold instead is that the fleet band narrows as sqrt(n) relative to the
+    #: scaled per-vehicle band, and that the centre is the mean of the clamped
+    #: need (the sum of medians is not the median of the sum).
+    b = s.fleet_energy_need_basis
+    assert b["method"] == "clt_normal_convolution"
+    assert s.fleet_energy_need_kwh["p50"] == round(
+        b["per_vehicle_mean_kwh"] * s.fleet_size, 1)
 
 
 def test_load_base_follows_eia_shape_and_ev_is_positive():
@@ -448,7 +466,7 @@ if __name__ == "__main__":
 #: Pinning the value HERE makes a prior change a reviewed diff. It is expected
 #: to move when the priors are genuinely re-pulled; moving it is then a
 #: deliberate line in a commit, which is the whole point.
-EXPECTED_PRIORS_FINGERPRINT = "f9556e5b43245f13b6cbd00a451ed141"
+EXPECTED_PRIORS_FINGERPRINT = "e3262decaae84317737dfd71817437e7"
 
 #: What the engine's own content hash said at pull time. Recorded in the
 #: snapshot manifest so a snapshot can be checked against the source it claims
@@ -539,3 +557,146 @@ def test_a_non_monotone_quantile_grid_is_refused(tmp_path):
     bad.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="monotone"):
         _load_priors(bad)
+
+
+# ---------------------------------------------------------------------------
+# L-36: the fleet band is a convolution, not a scaling.
+# ---------------------------------------------------------------------------
+
+def _soc(n):
+    return forecast_soc_return(PRIORS, departure_soc_pct=90, target_soc_pct=80,
+                               battery_kwh=90, fleet_size=n)
+
+
+def test_the_fleet_band_narrows_as_sqrt_n_not_linearly():
+    """The measurement, on the committed priors at the flagship fleet size.
+
+    Before: p10 1829.0, p90 8496.0 kWh — the per-vehicle band scaled by 118.
+    After:  p10 4741.1, p90 5329.1 — the quantiles of the fleet TOTAL.
+    The old band was about 11x too wide; the finding estimated 3.7x, and the
+    measured factor is sqrt(118) = 10.9 because the error IS the missing
+    sqrt(n).
+    """
+    s = _soc(118)
+    scaled = {p: v * 118 for p, v in s.energy_need_per_vehicle_kwh.items()}
+    old_halfwidth = (scaled["p90"] - scaled["p10"]) / 2
+    new_halfwidth = (s.fleet_energy_need_kwh["p90"]
+                     - s.fleet_energy_need_kwh["p10"]) / 2
+    assert new_halfwidth < old_halfwidth / 5, (
+        f"the fleet band is still scaled, not convolved: half-width "
+        f"{new_halfwidth:.0f} against the scaled {old_halfwidth:.0f}")
+    assert 9 < old_halfwidth / new_halfwidth < 13, (
+        "the ratio should be about sqrt(118) = 10.9")
+
+
+def test_the_band_narrows_with_fleet_size():
+    """The property that distinguishes a convolution from a scaling: a bigger
+    fleet is MORE predictable per vehicle, not equally so."""
+    def rel(n):
+        s = _soc(n)
+        f = s.fleet_energy_need_kwh
+        return (f["p90"] - f["p10"]) / f["p50"]
+    wide, narrow = rel(30), rel(3000)
+    assert narrow < wide / 5, (
+        f"relative band {narrow:.4f} at n=3000 vs {wide:.4f} at n=30 — it is "
+        f"not narrowing as sqrt(n)")
+
+
+def test_the_centre_is_the_mean_of_the_clamped_need_not_the_scaled_median():
+    """`_need` is max(0, ...), so it is nonlinear and the sum of medians is not
+    the median of the sum. The two differ on the committed priors."""
+    s = _soc(118)
+    scaled_median = s.energy_need_per_vehicle_kwh["p50"] * 118
+    assert abs(s.fleet_energy_need_kwh["p50"] - scaled_median) > 100, (
+        "the centre still tracks the scaled median; the clamp is being ignored")
+
+
+def test_a_small_fleet_carries_the_clt_caveat():
+    assert "caveat" in _soc(10).fleet_energy_need_basis
+    assert "caveat" not in _soc(200).fleet_energy_need_basis
+
+
+def test_the_basis_travels_with_the_number():
+    d = _soc(118).to_dict() if hasattr(_soc(118), "to_dict") else None
+    s = _soc(118)
+    b = s.fleet_energy_need_basis
+    assert b["assumes"].startswith("vehicles independent")
+    assert b["z_p90"] == 1.2816
+    assert b["per_vehicle_stddev_kwh"] > 0
+
+
+# ---------------------------------------------------------------------------
+# L-35: every hourly shape declares its clock, and the site's clock is the one
+# the forecast reports in.
+# ---------------------------------------------------------------------------
+
+def test_every_hourly_profile_declares_its_clock_basis():
+    for code, ps in PRIORS.profiles.items():
+        for name, prof in ps.items():
+            if prof.profile_kind == "hourly_24":
+                assert prof.clock_basis, f"{code}.{name} declares no clock_basis"
+                ZoneInfo(prof.clock_basis)   # must be a real zone
+
+
+def test_an_hourly_profile_without_a_basis_is_refused(tmp_path):
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    del raw["profiles"]["acn_data"]["hourly_charge_arrival_rate"]["clock_basis"]
+    raw["manifest"]["fingerprint_md5"] = fingerprint(_canonical_priors(raw))
+    bad = tmp_path / "priors.json"
+    bad.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="clock_basis"):
+        _load_priors(bad)
+
+
+def test_the_acn_shape_is_the_canonical_workplace_curve():
+    """The evidence the refit rests on.
+
+    The committed shape peaked at h15 and troughed at h07-h10 while describing
+    workplace charging at Caltech + JPL — both America/Los_Angeles. Rotating by
+    -8h recovers the curve those sites actually have: everyone arrives in the
+    morning and plugs in, and nothing happens overnight. A shape that peaks at
+    3 p.m. and is dead at 8 a.m. is not workplace charging; it is UTC.
+    """
+    acn = PRIORS.profiles["acn_data"]["hourly_charge_arrival_rate"]
+    assert acn.clock_basis == "America/Los_Angeles"
+    by_hour = {int(k): v for k, v in acn.data.items()}
+    assert max(by_hour, key=by_hour.get) == 7, "the peak is not the morning plug-in"
+    assert min(by_hour, key=by_hour.get) == 2, "the trough is not the small hours"
+    #: near-zero overnight, busy in the morning. The quiet window measured on
+    #: the rotated shape is 23:00-02:00 (0.10, 0.07, 0.04, 0.02); 03:00 carries
+    #: a 0.32 blip, so the window is what the data shows and not a round number.
+    assert max(by_hour[h] for h in (23, 0, 1, 2)) < 0.2
+    assert by_hour[7] > 4.0
+    #: ...and the morning is an order of magnitude above the night
+    assert by_hour[7] > 20 * max(by_hour[h] for h in (23, 0, 1, 2))
+
+
+def test_the_load_forecast_reads_each_shape_on_the_site_clock():
+    """Two shapes on two clocks were added at the same hour index.
+
+    On a Nashville site (America/Chicago): the EIA base shape is already
+    Central and must not move, while the ACN shape must be read two hours
+    earlier — 07:00 Pacific is 09:00 Central — so the EV peak lands at 09:00.
+    Before the fix the raw UTC index was read as local and the EV peak sat at
+    15:00, six hours off on this site's clock and eight off the Pacific curve.
+    """
+    l = forecast_load(PRIORS, base_load_kw=120, ev_daily_sessions=90)
+    ev = {h["hour_of_day"]: h["ev_kw_expected"] for h in l.hours}
+    base = {h["hour_of_day"]: h["base_kw"] for h in l.hours}
+    assert max(ev, key=ev.get) == 9, f"EV peak at {max(ev, key=ev.get)}, not 09:00"
+    assert max(base, key=base.get) == 18, "the Central grid shape moved"
+
+
+def test_moving_the_site_moves_the_shapes_with_it():
+    """A Los Angeles site sees the ACN peak at its own 07:00, unshifted."""
+    la = forecast_load(PRIORS, base_load_kw=120, ev_daily_sessions=90,
+                       site_tz="America/Los_Angeles")
+    ev = {h["hour_of_day"]: h["ev_kw_expected"] for h in la.hours}
+    assert max(ev, key=ev.get) == 7
+
+
+def test_the_response_says_which_clock_its_hours_are_in():
+    f = forecast(PRIORS, fleet_size=100, turns_per_day=6, base_load_kw=120,
+                 ev_daily_sessions=90, departure_soc_pct=90,
+                 target_soc_pct=80, battery_kwh=90)
+    assert f["site_tz"] == "America/Chicago"

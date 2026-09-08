@@ -53,6 +53,13 @@ class Profile:
     profile_kind: str
     units: str
     data: dict[str, float]
+    #: WHICH CLOCK THE HOUR KEYS ARE IN (finding L-35). An hourly_24 profile is
+    #: a shape over hour-of-day, and "which day, on whose clock" is not a
+    #: detail: acn_data.hourly_charge_arrival_rate was bucketed in UTC while
+    #: eia_grid.hourly_grid_demand_shape is built explicitly in America/Chicago
+    #: by its ingest (`centralHour`), and both were indexed at the SAME `hod`.
+    #: Required on every hourly_24 profile; daily_7 profiles carry None.
+    clock_basis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,9 +198,21 @@ def load_priors(path: str | Path = SNAPSHOT_PATH) -> Priors:
                 dataset_code=code, profile_name=name,
                 profile_kind=p["profile_kind"], units=p["units"],
                 data={str(k): float(v) for k, v in p["data"].items()},
+                clock_basis=p.get("clock_basis"),
             )
             for name, p in ps.items()
         }
+    for code, ps in profiles.items():
+        for name, prof in ps.items():
+            #: An hourly shape without a declared clock is unusable: it cannot
+            #: be combined with another shape, and combining it anyway is the
+            #: defect (L-35). Refused at load, like a fingerprint mismatch.
+            if prof.profile_kind == "hourly_24" and not prof.clock_basis:
+                raise ValueError(
+                    f"priors {code}.{name}: an hourly_24 profile must declare "
+                    f"its clock_basis (the timezone its hour keys are bucketed "
+                    f"in); combining two shapes on different clocks at the same "
+                    f"hour index is how a load forecast peaks 8 hours late")
 
     distributions: dict[str, dict[str, Distribution]] = {}
     for code, ds in raw["distributions"].items():
