@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app.forecasters.priors import load_priors
 from app.forecasters.statistical import (
+    _poisson_quantile,
     forecast, forecast_arrivals, forecast_load, forecast_soc_return,
 )
 
@@ -291,6 +292,46 @@ def test_the_diurnal_shape_cannot_reach_the_surge_threshold_against_a_flat_mean(
     ceiling = (best / W) * max(float(v) for v in dow.values())
     assert round(ceiling, 4) == 1.9115, f"T4 FAIL: ceiling moved to {ceiling}"
     assert ceiling < 2.0
+
+
+def test_the_uncertainty_band_has_NON_ZERO_WIDTH_where_it_should():
+    """Monotonicity alone certifies nothing: `p10 <= p50 <= p90` is satisfied by
+    three identical numbers, so a band that collapsed to a point — the whole
+    uncertainty machinery silently returning its own mean — passes the ordering
+    test. Nothing anywhere asserted a band was actually WIDE, or pinned a single
+    quantile to a value.
+
+    That leaves three separate mechanisms unguarded at once: `_poisson_quantile`,
+    the 1.28-sigma load band, and the per-hour lambda that feeds both.
+    """
+    a = forecast_arrivals(PRIORS, fleet_size=118, turns_per_day=2.5, dow=0)
+    busy = [h for h in a.hours if h["expected_arrivals"] >= 2.0]
+    assert busy, "T4 FAIL: no hour busy enough to carry a band; fixture is wrong"
+    assert any(h["p90"] > h["p50"] > h["p10"] for h in busy), (
+        "T4 FAIL: every arrivals band has zero width -- the quantiles collapsed "
+        "to a point and the monotonicity test could not tell")
+
+    l = forecast_load(PRIORS, base_load_kw=120, ev_daily_sessions=90)
+    assert any(h["total_kw_p90"] > h["total_kw_p50"] > h["total_kw_p10"]
+               for h in l.hours), (
+        "T4 FAIL: the 1.28-sigma load band has zero width everywhere")
+
+
+def test_the_quantile_function_is_pinned_to_golden_values():
+    """One collapsed band is a bug the test above catches; a band that is merely
+    WRONG is not. These are computed values, regenerable from the function's own
+    definition (smallest k with P(Poisson(lam) <= k) >= p), and they pin the
+    arithmetic itself.
+
+    The lam <= 0 case is the one place a zero-width band is CORRECT: an hour
+    that expects nothing has no uncertainty to express.
+    """
+    assert _poisson_quantile(2.5, 0.10) == 1
+    assert _poisson_quantile(2.5, 0.50) == 2
+    assert _poisson_quantile(2.5, 0.90) == 5
+    assert _poisson_quantile(10.0, 0.90) == 14
+    assert _poisson_quantile(0.0, 0.90) == 0, (
+        "an hour expecting nothing must have a degenerate band, not a guess")
 
 
 def test_quantile_ordering_is_monotonic():
