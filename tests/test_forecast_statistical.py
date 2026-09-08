@@ -13,7 +13,15 @@ import json
 import math
 from pathlib import Path
 
-from app.forecasters.priors import load_priors
+import pytest
+
+from app.forecasters.priors import (
+    SNAPSHOT_PATH,
+    _canonical_priors,
+    fingerprint,
+    load_priors,
+)
+from app.forecasters.priors import load_priors as _load_priors
 from app.forecasters.statistical import (
     _poisson_quantile,
     forecast, forecast_arrivals, forecast_load, forecast_soc_return,
@@ -422,3 +430,112 @@ if __name__ == "__main__":
         fn()
         print(f"{fn.__name__} PASS")
     print("ALL FORECAST TESTS PASS")
+
+
+# ---------------------------------------------------------------------------
+# L-33 / L-34 / L-54: the priors snapshot's identity, content and bounds.
+# ---------------------------------------------------------------------------
+
+#: THE AUTHORITY LIVES OUTSIDE THE ARTIFACT (finding L-33).
+#:
+#: load_priors reads the expected hash out of the same JSON blob it is hashing,
+#: which detects truncation and accidental corruption and nothing more: any
+#: edit that also recomputes fingerprint() -- eleven lines, exported from the
+#: same module -- is accepted silently while the `datasets` block still declares
+#: ACN / TLC / EIA / NREL and every /forecast response still stamps
+#: provenance.source_name as if the number came from the public dataset.
+#:
+#: Pinning the value HERE makes a prior change a reviewed diff. It is expected
+#: to move when the priors are genuinely re-pulled; moving it is then a
+#: deliberate line in a commit, which is the whole point.
+EXPECTED_PRIORS_FINGERPRINT = "f9556e5b43245f13b6cbd00a451ed141"
+
+#: What the engine's own content hash said at pull time. Recorded in the
+#: snapshot manifest so a snapshot can be checked against the source it claims
+#: to come from, rather than only against itself.
+EXPECTED_ENGINE_FINGERPRINT = "11a246262ff7a2c929483b1ee0a7cd2d"
+
+
+def test_the_priors_fingerprint_is_pinned_outside_the_artifact():
+    assert PRIORS.fingerprint == EXPECTED_PRIORS_FINGERPRINT, (
+        "the priors changed. If that was deliberate, update this literal in the "
+        "same commit as the snapshot — that diff is the review.")
+
+
+def test_the_snapshot_records_which_engine_state_it_was_pulled_from():
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    m = raw["manifest"]
+    assert m["engine_calibration_fingerprint"] == EXPECTED_ENGINE_FINGERPRINT
+    pull = m["engine_pull"]
+    assert pull["project_ref"] == "gxdrcyphqjzjsuhxuqtg"
+    #: per dataset, the source's own size and span at pull time
+    for code in ("acn_data", "nyc_tlc", "eia_grid", "nrel_fleet"):
+        d = pull["datasets"][code]
+        assert d["record_count"] > 0
+        assert d["date_range_start"] < d["date_range_end"]
+
+
+def test_a_refit_that_lands_the_same_numbers_does_not_change_the_identity():
+    """The claim fingerprint()'s docstring makes, now true (finding L-34).
+
+    `fitted_at` is a wall-clock timestamp copied from the engine DB and it was
+    inside the hash, so a re-snapshot of NUMERICALLY IDENTICAL priors changed
+    every forecast's `priors_fingerprint` — the field that identifies a
+    forecast — because a refit job ran, not because a number moved.
+    """
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    before = fingerprint(_canonical_priors(raw))
+    for ds in raw["distributions"].values():
+        for d in ds.values():
+            d["fitted_at"] = "2099-01-01 00:00:00+00"
+    assert fingerprint(_canonical_priors(raw)) == before
+
+
+def test_a_changed_number_still_changes_the_identity():
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    before = fingerprint(_canonical_priors(raw))
+    ds = next(iter(raw["distributions"].values()))
+    d = next(iter(ds.values()))
+    d["quantile_grid"][0] = float(d["quantile_grid"][0]) + 1.0
+    assert fingerprint(_canonical_priors(raw)) != before
+
+
+def test_every_numeric_prior_field_loads_as_a_number():
+    """All four are JSON STRINGS in the snapshot and were assigned straight
+    through into a dataclass annotated `float | None` (finding L-54)."""
+    seen = 0
+    for ds in PRIORS.distributions.values():
+        for dist in ds.values():
+            for field in ("mean_value", "stddev_value", "hard_min", "hard_max"):
+                v = getattr(dist, field)
+                if v is not None:
+                    assert isinstance(v, float), f"{field} is {type(v).__name__}"
+                    seen += 1
+    assert seen > 0
+
+
+def test_the_declared_bounds_are_enforced_not_decorative(tmp_path):
+    """hard_min / hard_max were loaded and read by no code path at all."""
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    ds = next(iter(raw["distributions"].values()))
+    name, d = next(iter(ds.items()))
+    d["quantile_grid"][-1] = float(d["hard_max"]) + 1.0
+    bad = tmp_path / "priors.json"
+    raw["manifest"]["fingerprint_md5"] = fingerprint(_canonical_priors(raw))
+    bad.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="hard_max"):
+        _load_priors(bad)
+
+
+def test_a_non_monotone_quantile_grid_is_refused(tmp_path):
+    """The lookup walks the grid in order, so p90 could come back below p50 and
+    every band built on it would be inverted with nothing raising."""
+    raw = json.loads(SNAPSHOT_PATH.read_text())
+    ds = next(iter(raw["distributions"].values()))
+    _name, d = next(iter(ds.items()))
+    d["quantile_grid"] = sorted((float(x) for x in d["quantile_grid"]), reverse=True)
+    bad = tmp_path / "priors.json"
+    raw["manifest"]["fingerprint_md5"] = fingerprint(_canonical_priors(raw))
+    bad.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="monotone"):
+        _load_priors(bad)
