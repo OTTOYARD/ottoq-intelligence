@@ -53,6 +53,13 @@ class Profile:
     profile_kind: str
     units: str
     data: dict[str, float]
+    #: WHICH CLOCK THE HOUR KEYS ARE IN (finding L-35). An hourly_24 profile is
+    #: a shape over hour-of-day, and "which day, on whose clock" is not a
+    #: detail: acn_data.hourly_charge_arrival_rate was bucketed in UTC while
+    #: eia_grid.hourly_grid_demand_shape is built explicitly in America/Chicago
+    #: by its ingest (`centralHour`), and both were indexed at the SAME `hod`.
+    #: Required on every hourly_24 profile; daily_7 profiles carry None.
+    clock_basis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,13 +88,90 @@ class Priors:
     generated_at: str
 
 
+#: Provenance-only fields inside a distribution: metadata about WHEN a fit ran,
+#: not about what it says. Excluded from the content hash (finding L-34).
+METADATA_FIELDS = ("fitted_at",)
+
+
 def fingerprint(content: dict) -> str:
     """md5 over the canonical content — same discipline as the engine's
     `ottoq_calibration_fingerprint()` (0201): a refit that lands the same
     numbers is not a change to the world, so generated_at / fitted_at are
-    excluded from the hash where they are metadata rather than content."""
+    excluded from the hash where they are metadata rather than content.
+
+    THAT SENTENCE WAS FALSE UNTIL 09-08 (finding L-34). Nothing excluded
+    anything: `load_priors` built the content as the three raw blocks and
+    hashed them whole, and every `distributions` entry carries a `fitted_at`
+    wall-clock timestamp copied from the engine DB. So a re-snapshot of
+    NUMERICALLY IDENTICAL priors changed the fingerprint, and the fingerprint
+    is not inert — it is stamped into every /forecast response as
+    `priors_fingerprint`, which is how a forecast is identified. Every forecast
+    got a new identity because a refit job ran, not because a number moved.
+    `_canonical_priors` now performs the exclusion the docstring describes; the
+    engine's own function has always done it ("Content only; timestamps are
+    deliberately left out").
+    """
     blob = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.md5(blob).hexdigest()
+
+
+def _canonical_priors(raw: dict) -> dict:
+    """The three content blocks, with per-distribution metadata stripped."""
+    distributions = {
+        code: {name: {k: v for k, v in d.items() if k not in METADATA_FIELDS}
+               for name, d in ds.items()}
+        for code, ds in raw["distributions"].items()
+    }
+    return {"datasets": raw["datasets"], "profiles": raw["profiles"],
+            "distributions": distributions}
+
+
+def _as_float(value, *, field: str, where: str):
+    """A numeric prior as a float, or None. Raises rather than carrying a str.
+
+    Every one of mean_value / stddev_value / hard_min / hard_max is a JSON
+    STRING in the committed snapshot, and all four were assigned straight
+    through `d.get(...)` into a dataclass annotated `float | None` (finding
+    L-54). `statistical.py` only survived because it wraps two of them in
+    `float()` at the point of use; the other two were never read at all.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"priors {where}: {field} is not numeric "
+                         f"({value!r})") from exc
+
+
+def _validate_distribution(where: str, dist) -> None:
+    """The declared bounds become an ENFORCED INVARIANT, not documentation.
+
+    `hard_min` / `hard_max` were loaded and then read by no code path at all,
+    so the bounds every distribution declares were decorative and the forecast
+    never checked a quantile against them (finding L-54). A non-monotone grid
+    is worse than a wrong one: the quantile lookup walks it in order, so p90
+    could come back below p50 and every band built on it would be inverted
+    without anything raising.
+    """
+    grid = dist.quantile_grid
+    if not grid:
+        raise ValueError(f"priors {where}: empty quantile_grid")
+    for a, b in zip(grid, grid[1:]):
+        if b < a:
+            raise ValueError(
+                f"priors {where}: quantile_grid is not monotone "
+                f"non-decreasing ({a} then {b}) — a lookup walks it in order, "
+                f"so a later quantile would return a smaller value")
+    lo, hi = dist.hard_min, dist.hard_max
+    if lo is not None and grid[0] < lo:
+        raise ValueError(f"priors {where}: quantile_grid starts at {grid[0]}, "
+                         f"below its declared hard_min {lo}")
+    if hi is not None and grid[-1] > hi:
+        raise ValueError(f"priors {where}: quantile_grid ends at {grid[-1]}, "
+                         f"above its declared hard_max {hi}")
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError(f"priors {where}: hard_min {lo} exceeds hard_max {hi}")
 
 
 def load_priors(path: str | Path = SNAPSHOT_PATH) -> Priors:
@@ -114,9 +198,21 @@ def load_priors(path: str | Path = SNAPSHOT_PATH) -> Priors:
                 dataset_code=code, profile_name=name,
                 profile_kind=p["profile_kind"], units=p["units"],
                 data={str(k): float(v) for k, v in p["data"].items()},
+                clock_basis=p.get("clock_basis"),
             )
             for name, p in ps.items()
         }
+    for code, ps in profiles.items():
+        for name, prof in ps.items():
+            #: An hourly shape without a declared clock is unusable: it cannot
+            #: be combined with another shape, and combining it anyway is the
+            #: defect (L-35). Refused at load, like a fingerprint mismatch.
+            if prof.profile_kind == "hourly_24" and not prof.clock_basis:
+                raise ValueError(
+                    f"priors {code}.{name}: an hourly_24 profile must declare "
+                    f"its clock_basis (the timezone its hour keys are bucketed "
+                    f"in); combining two shapes on different clocks at the same "
+                    f"hour index is how a load forecast peaks 8 hours late")
 
     distributions: dict[str, dict[str, Distribution]] = {}
     for code, ds in raw["distributions"].items():
@@ -125,15 +221,23 @@ def load_priors(path: str | Path = SNAPSHOT_PATH) -> Priors:
                 dataset_code=code, variable_name=name,
                 segment=d["segment"], units=d["units"],
                 sample_count=int(d["sample_count"]),
-                mean_value=d.get("mean_value"),
-                stddev_value=d.get("stddev_value"),
-                hard_min=d.get("hard_min"), hard_max=d.get("hard_max"),
+                mean_value=_as_float(d.get("mean_value"),
+                                     field="mean_value", where=f"{code}.{name}"),
+                stddev_value=_as_float(d.get("stddev_value"),
+                                       field="stddev_value", where=f"{code}.{name}"),
+                hard_min=_as_float(d.get("hard_min"),
+                                   field="hard_min", where=f"{code}.{name}"),
+                hard_max=_as_float(d.get("hard_max"),
+                                   field="hard_max", where=f"{code}.{name}"),
                 best_fit_family=d["best_fit_family"],
                 quantile_grid=[float(x) for x in d["quantile_grid"]],
                 fitted_at=d.get("fitted_at"),
             )
             for name, d in ds.items()
         }
+    for code, ds in distributions.items():
+        for name, dist in ds.items():
+            _validate_distribution(f"{code}.{name}", dist)
 
     priors = Priors(
         datasets=datasets, profiles=profiles, distributions=distributions,
@@ -144,9 +248,7 @@ def load_priors(path: str | Path = SNAPSHOT_PATH) -> Priors:
     # Verify the snapshot's content hash before trusting it. A snapshot that
     # does not match its own fingerprint is a tampered or truncated artifact and
     # must be refused, not used.
-    content = {"datasets": raw["datasets"], "profiles": raw["profiles"],
-               "distributions": raw["distributions"]}
-    actual = fingerprint(content)
+    actual = fingerprint(_canonical_priors(raw))
     if actual != priors.fingerprint:
         raise ValueError(
             f"priors snapshot fingerprint mismatch: manifest says "

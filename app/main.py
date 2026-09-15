@@ -27,13 +27,35 @@ from app.forecasters.statistical import forecast
 
 app = FastAPI(title="OTTO-Q Intelligence Service", version="0.1.0")
 
-# Shared-secret bearer auth. Set OTTOQ_API_TOKEN in the container env; the twin sends
-# it as `Authorization: Bearer <token>`. If unset (local dev), auth is open.
+# Shared-secret bearer auth. Set OTTOQ_API_TOKEN in the container env; the twin
+# sends it as `Authorization: Bearer <token>`.
+#
+# THIS USED TO FAIL OPEN, AND THE DEPLOY MAKES THAT SERIOUS. The guard read
+# `if _API_TOKEN and authorization != ...`, so an unset OTTOQ_API_TOKEN
+# short-circuited the comparison and every request was allowed. deploy/
+# DEPLOY_EC2.md instructs opening TCP 8080 to 0.0.0.0/0 with the sentence
+# "it's protected by a bearer token below" -- which was true only while the
+# variable happened to be set. One missing env var and the sentence became
+# false silently, with nothing in the response to say so.
+#
+# It now fails CLOSED: no token configured means no request is served. Local
+# development opts out explicitly with OTTOQ_ALLOW_UNAUTHENTICATED=1, which is
+# a thing you have to type and can grep the fleet for -- unlike the absence of
+# a variable, which looks identical to a correct deployment.
 _API_TOKEN = os.environ.get("OTTOQ_API_TOKEN")
+_ALLOW_UNAUTHENTICATED = os.environ.get("OTTOQ_ALLOW_UNAUTHENTICATED") == "1"
 
 
 def require_token(authorization: str = Header(default="")):
-    if _API_TOKEN and authorization != f"Bearer {_API_TOKEN}":
+    if _ALLOW_UNAUTHENTICATED:
+        return
+    if not _API_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="service not configured: set OTTOQ_API_TOKEN, or "
+                   "OTTOQ_ALLOW_UNAUTHENTICATED=1 for local development",
+        )
+    if authorization != f"Bearer {_API_TOKEN}":
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
