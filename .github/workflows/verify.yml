@@ -27,4 +27,4 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt pytest
       - name: Test suite (forecast priors, contamination guard, energy MPC, auth)
-        run: python3 -m pytest -q
+        run: python3 -m pytest -q tests
