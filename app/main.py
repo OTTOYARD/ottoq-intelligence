@@ -6,22 +6,24 @@ and learned inference that cannot live in Postgres:
 
     POST /optimize/energy   rolling-horizon BESS+charge MPC (FR-1)         [LIVE]
     POST /forecast          probabilistic arrivals/load/SoC (FR-2)        [stub -> GPU model]
-    POST /assign            cuOpt charger/bay/service assignment (FR-3)    [stub -> cuOpt]
+    POST /assign            deterministic CP-SAT assignment (FR-3)        [LIVE]
     POST /orchestrate       Nemotron conductor over the stack (FR-4)      [stub -> NIM]
     GET  /health
 
-Doctrine: model proposes, optimizer disposes, shield guarantees, loop learns.
+Doctrine: model selects a bounded objective, optimizer proposes, the SQL
+kernel disposes, the shield guarantees, and rejection feedback retries twice.
 Every optimizer output is advisory to the twin's deterministic safety shield.
 """
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.optimizers.energy_mpc import BessState, optimize_energy
+from app.optimizers.assignment_cpsat import optimize_assignment
 from app.forecasters.priors import load_priors
 from app.forecasters.statistical import forecast
 
@@ -88,7 +90,7 @@ class EnergyOptIn(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "ottoq-intelligence", "optimizers": ["energy_mpc"]}
+    return {"ok": True, "service": "ottoq-intelligence", "optimizers": ["energy_mpc", "cp_sat_forward_lex"]}
 
 
 @app.post("/optimize/energy", dependencies=[Depends(require_token)])
@@ -145,10 +147,51 @@ def forecast_endpoint(req: ForecastIn):
     )
 
 
-@app.post("/assign")
-def assign_stub():
-    # FR-3: replace with cuOpt (sync/batch, constraint-aware) charger/bay/service assignment.
-    return {"status": "not_implemented", "note": "FR-3 cuOpt assignment pending"}
+class SolverDirectiveIn(BaseModel):
+    objective: str = "readiness_first"
+    why: str = ""
+
+
+class AssignmentFeedbackIn(BaseModel):
+    entity_id: str
+    stall_id: Optional[str] = None
+    reason: Optional[str] = None
+    rule_codes: List[str] = Field(default_factory=list)
+
+
+class AssignmentIn(BaseModel):
+    sim_run_id: str
+    depot_id: str
+    frame: dict[str, Any]
+    class_rows: List[dict[str, Any]]
+    site: dict[str, Any]
+    directive: SolverDirectiveIn
+    feedback: List[AssignmentFeedbackIn] = Field(default_factory=list)
+    max_assets: int = Field(8, ge=1, le=24)
+    det_budget_s: float = Field(0.25, ge=0.01, le=5.0)
+    max_retries: int = Field(2, ge=0, le=2)
+    hour_of_day: int = Field(12, ge=0, le=23)
+
+
+@app.post("/assign", dependencies=[Depends(require_token)])
+def assign(req: AssignmentIn):
+    """Run the deterministic CP-SAT proposer. The kernel still disposes."""
+    try:
+        return optimize_assignment(
+            frame=req.frame,
+            class_rows=req.class_rows,
+            site=req.site,
+            sim_run_id=req.sim_run_id,
+            depot_id=req.depot_id,
+            objective=req.directive.objective,
+            feedback=[item.model_dump() for item in req.feedback],
+            max_assets=req.max_assets,
+            det_budget_s=req.det_budget_s,
+            max_retries=req.max_retries,
+            hour_of_day=req.hour_of_day,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/orchestrate")
