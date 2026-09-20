@@ -1,0 +1,138 @@
+# deploy — rebuild the intelligence service on its EC2 box and PROVE the new image
+# is the one now serving.
+#
+# WHY THIS EXISTS. The service is deployed by hand: SSH in, `git pull`, `docker build`,
+# `docker run`. That is documented in deploy/DEPLOY_EC2.md and it works, but it means every
+# code change needs a human at a terminal — and on 2026-09-20 that cost a full day of
+# CP-SAT being unreachable from the twin. Commit 7923cf9 (2026-09-16) added
+# app/optimizers/assignment_cpsat.py AND changed Dockerfile + requirements.txt (OR-Tools),
+# so the running image physically could not serve CP-SAT. The twin's edge function called
+# /assign, got a 2xx with a pre-CP-SAT shape, and correctly refused it as
+# "intelligence /assign returned an invalid proposer envelope". Nothing was broken except
+# that the image predated the feature.
+#
+# THE TELL WAS IN /health THE WHOLE TIME: it serves `optimizers`, and the deployed build
+# answered ["energy_mpc"] while main answers ["energy_mpc","cp_sat_forward_lex"]. That is
+# why the verify step below asserts on that list rather than on a 200 — a health check that
+# only proves the box is up would have passed on the stale image.
+#
+# SETUP, ONCE. Add three repository secrets (Settings -> Secrets and variables -> Actions):
+#   EC2_HOST      the instance's public IPv4
+#   EC2_USER      ubuntu
+#   EC2_SSH_KEY   the full private key text that matches the instance's key pair
+# Optionally EC2_PORT (defaults to 22).
+#
+# After that this runs on demand from the Actions tab, or automatically on a push to main
+# that touches the service.
+
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      expect_optimizer:
+        description: "Optimizer name that /health must list after deploy"
+        required: false
+        default: "cp_sat_forward_lex"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - "requirements.txt"
+      - ".github/workflows/deploy.yml"
+
+concurrency:
+  # Two concurrent deploys would race on the container name. Never cancel in progress:
+  # a half-replaced container is worse than a queued deploy.
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Refuse early if the deploy secrets are absent
+        # Without this the ssh step fails with an opaque key-parse error. A missing
+        # secret should name itself.
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+          KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          missing=""
+          [ -z "$HOST" ] && missing="$missing EC2_HOST"
+          [ -z "$USER" ] && missing="$missing EC2_USER"
+          [ -z "$KEY" ]  && missing="$missing EC2_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::deploy is not configured. Missing repository secret(s):$missing"
+            echo "See the header of .github/workflows/deploy.yml for the one-time setup."
+            exit 1
+          fi
+          echo "deploy secrets present"
+
+      - name: Rebuild and restart the container
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          command_timeout: 15m
+          script_stops: true
+          script: |
+            set -euo pipefail
+            cd ~/ottoq-intelligence
+
+            git fetch --prune origin
+            git checkout main
+            git reset --hard origin/main
+            echo "deploying $(git rev-parse --short HEAD)"
+
+            # Carry the running container's token forward rather than requiring it as a
+            # secret here. The service REFUSES every request with 503 when
+            # OTTOQ_API_TOKEN is unset (since 2026-09-07), so losing it on a rebuild would
+            # take the service down in a way that looks like a network fault.
+            TOKEN="$(docker inspect ottoq-intel \
+                      --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                     | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)"
+            if [ -z "${TOKEN:-}" ]; then
+              echo "::error::could not read OTTOQ_API_TOKEN from the running container."
+              echo "Refusing to redeploy without it -- a tokenless service answers 503 to everything."
+              exit 1
+            fi
+
+            # Build the new image under a temporary tag so a build failure leaves the
+            # CURRENT container running and serving.
+            docker build -t ottoq-intel:new .
+
+            docker rm -f ottoq-intel 2>/dev/null || true
+            docker tag ottoq-intel:new ottoq-intel:latest
+            docker run -d --restart unless-stopped -p 8080:8080 \
+              -e OTTOQ_API_TOKEN="$TOKEN" \
+              --name ottoq-intel ottoq-intel:latest
+
+            # Give uvicorn a moment, then prove locally before the workflow asserts remotely.
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            echo "local /health: $(curl -fsS --max-time 5 http://127.0.0.1:8080/health)"
+
+      - name: Assert /health lists the expected optimizer
+        # The assertion that actually matters. A 200 from /health proves the box is up and
+        # proves nothing about which build is on it -- that is exactly how the stale image
+        # went unnoticed. This fails the deploy if the optimizer is still missing.
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+          EXPECT: ${{ github.event.inputs.expect_optimizer || 'cp_sat_forward_lex' }}
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS --max-time 15 "http://${HOST}:8080/health")"
+          echo "remote /health: $body"
+          if ! printf '%s' "$body" | grep -q -- "$EXPECT"; then
+            echo "::error::/health does not list '$EXPECT'. The running image is not the build that was just pushed."
+            exit 1
+          fi
+          echo "verified: /health lists $EXPECT"
