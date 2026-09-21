@@ -1,0 +1,146 @@
+# aws-recon — prove the automation credentials work, and find the intelligence box.
+#
+# WHY THIS IS SEPARATE FROM deploy.yml, AND WHY IT IS READ-ONLY.
+#
+# deploy.yml reaches the instance over SSH and needs EC2_HOST / EC2_USER / EC2_SSH_KEY. Those
+# were never set: the operator took the shorter route in deploy/ACTIVATE_AWS_ACCESS.md and
+# supplied AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY instead, so that AWS Systems Manager can
+# reach the box with no key file, no security-group edit and no port open to the internet.
+#
+# This workflow is the FIRST thing to run against those credentials, and it changes nothing.
+# It answers four questions, in order, and stops:
+#
+#   1. Do the credentials work at all, and what identity are they?
+#   2. Which region is the instance in? (The runbook deliberately does not ask the operator
+#      for a region, so this sweeps every region the account can describe.)
+#   3. Is the instance registered with SSM — i.e. can commands reach it without SSH?
+#   4. Does the instance have the IAM role attached that SSM registration requires?
+#
+# Read-only on purpose. Every call below is a Describe/List. Nothing is created, modified,
+# terminated, started or stopped. A recon step that mutates is a recon step you cannot run
+# twice to check what changed, and the account holds resources this automation did not create.
+#
+# SECRET HYGIENE. The AWS account ID is masked out of the log with ::add-mask:: before it is
+# ever printed, and the credentials themselves are only ever passed to the AWS CLI through
+# the environment. The instance's public IP is printed, because the runbook's whole point is
+# that the operator should not have to look it up.
+
+name: aws-recon
+
+on:
+  workflow_dispatch:
+    inputs:
+      name_filter:
+        description: "Substring to match against instance Name tags (blank = list them all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: aws-recon
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      NAME_FILTER: ${{ inputs.name_filter }}
+    steps:
+      - name: Refuse early and legibly if the secrets are missing
+        run: |
+          if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID and/or AWS_SECRET_ACCESS_KEY is not set on this repository."
+            echo "Add them under Settings -> Secrets and variables -> Actions."
+            echo "deploy/ACTIVATE_AWS_ACCESS.md Part 3 has the click-by-click steps."
+            exit 1
+          fi
+          echo "Both credential secrets are present."
+
+      - name: 1. Whose credentials are these
+        id: whoami
+        run: |
+          set -euo pipefail
+          # Mask the account id before anything can echo it.
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+          arn="$(aws sts get-caller-identity --query Arn --output text)"
+          # The ARN embeds the account id, which is now masked, so this is safe to print.
+          echo "identity: ${arn}"
+          echo "user_name=$(basename "${arn}")" >> "$GITHUB_OUTPUT"
+          echo "Credentials are valid."
+
+      - name: 2. Sweep every region for EC2 instances
+        run: |
+          set -uo pipefail
+          regions="$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text)"
+          echo "regions this account can describe: ${regions}"
+          echo
+          found=0
+          for r in ${regions}; do
+            # --no-cli-pager and a tight query: one line per instance, cheap in every region.
+            out="$(aws ec2 describe-instances --region "$r" \
+                    --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,IamInstanceProfile.Arn,join(`,`,Tags[?Key==`Name`].Value)]' \
+                    --output text 2>/dev/null || true)"
+            if [ -n "${out}" ] && [ "${out}" != "None" ]; then
+              if [ -n "${NAME_FILTER}" ]; then
+                filtered="$(printf '%s\n' "${out}" | grep -i -- "${NAME_FILTER}" || true)"
+              else
+                filtered="${out}"
+              fi
+              if [ -n "${filtered}" ]; then
+                found=1
+                echo "=== ${r} ==="
+                echo "  InstanceId  State  Type  PublicIp  IamProfileArn  NameTag"
+                printf '%s\n' "${filtered}" | sed 's/^/  /'
+                echo
+              fi
+            fi
+          done
+          if [ "${found}" = "0" ]; then
+            echo "::warning::No EC2 instances matched in any region."
+            echo "Either the instance is in a region this user cannot describe, or the Name tag"
+            echo "does not contain the filter, or it lives in a different AWS account."
+          fi
+
+      - name: 3. Which instances SSM can already reach
+        run: |
+          set -uo pipefail
+          regions="$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text)"
+          any=0
+          for r in ${regions}; do
+            out="$(aws ssm describe-instance-information --region "$r" \
+                    --query 'InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]' \
+                    --output text 2>/dev/null || true)"
+            if [ -n "${out}" ] && [ "${out}" != "None" ]; then
+              any=1
+              echo "=== ${r} : SSM-managed ==="
+              echo "  InstanceId  PingStatus  Platform  AgentVersion"
+              printf '%s\n' "${out}" | sed 's/^/  /'
+              echo
+            fi
+          done
+          if [ "${any}" = "0" ]; then
+            echo "SSM currently manages NO instances in any region."
+            echo
+            echo "That is the expected starting state, and it is what step 2 of the runbook fixes."
+            echo "An instance appears here only when BOTH are true:"
+            echo "  - an instance profile granting AmazonSSMManagedInstanceCore is attached, and"
+            echo "  - the SSM agent on the box is running and can reach the SSM endpoints."
+            echo "Compare the IamProfileArn column in step 2: a 'None' there is the reason."
+          fi
+
+      - name: 4. What the recon concludes
+        run: |
+          echo "Read-only recon complete. Nothing in the account was modified."
+          echo
+          echo "Next actions are decided from the output above, not from this file:"
+          echo "  - instance found + already SSM-managed  -> go straight to rebuilding the service"
+          echo "  - instance found + no instance profile  -> attach the SSM role (needs IAMFullAccess),"
+          echo "                                             then re-run this workflow to confirm"
+          echo "  - no instance found                     -> ask the operator which account/region it is in"
