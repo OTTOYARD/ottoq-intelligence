@@ -1,0 +1,188 @@
+# aws-assign-eip — give the intelligence box a PERMANENT address, and prove it is reachable.
+#
+# WHY THIS EXISTS, AND IT IS THE ROOT CAUSE OF CP-SAT NEVER BEING CALLED.
+#
+# `ottoq-cpsat-propose` reads the service address from the Supabase secret `OTTOQ_INTEL_URL`, which
+# is set once and then never moves. The instance has **no Elastic IP** (`describe-addresses` in
+# us-east-1 returns nothing at all), so every stop/start hands it a DIFFERENT auto-assigned public
+# IPv4 address. It was stopped 2026-09-21 02:52 and started again at 03:29:21, and from that moment
+# the secret pointed at an address nothing answers on.
+#
+# The measurement that proves the consequence, taken 07:15 UTC over SSM: the service's own uvicorn
+# access log holds **zero `POST /assign` lines** since the container was created at 04:30:55, while
+# answering `/health` on loopback in **14 ms** with `cp_sat_forward_lex` in its optimizer list, at
+# **0.14% CPU** and loadavg 0.00. A healthy, idle, correctly-built solver that has never been asked
+# a question. From the caller's side all twelve attempts on run f13fc580 read
+# `latency 20005-20011 ms, http_status NULL` -- clustered inside 6 ms of the timeout, which is what
+# a connection that never completes looks like and what a variable-difficulty solve does not.
+#
+# So the fix is not a bigger timeout. It is an address that stops moving.
+#
+# ══ COST, SOURCED, BECAUSE THE LAST EIP IN THIS ACCOUNT WAS DELETED FOR BILLING ══
+#
+# AWS charges **$0.005 per public IPv4 address per hour, in-use or idle**, for every public IPv4
+# address since 2024-02-01 -- the same rate whether it is an Elastic IP or an auto-assigned one.
+#   https://aws.amazon.com/blogs/aws/new-aws-public-ipv4-address-charge-public-ip-insights/
+#   https://aws.amazon.com/vpc/pricing/
+#
+# So this workflow does **not add a cost**: the box already has an auto-assigned public IPv4 and
+# already pays that rate. An Elastic IP REPLACES it at the same price and stops it changing. That
+# is also why `aws-release-eip` was right on 2026-09-21: `54.166.168.193` was billing while
+# attached to an instance stopped since 2026-08-15 -- an address paid for and serving nothing. The
+# wasteful case is an address with no live service behind it, not an address that is stable.
+#
+# ══ GUARDS ═════════════════════════════════════════════════════════════════
+#
+# Same two independent guards as aws-activate-ssm, for the same reason -- this account holds three
+# GPU instances at $1-$10+/hour and no workflow here may be able to reach one:
+#   1. the instance id is required with no default;
+#   2. its Name tag must equal `ottoq-intel-2` exactly;
+#   3. its instance type must be on the cheap allowlist;
+#   4. and it must already be RUNNING -- this workflow never starts anything.
+# Reversible: `aws-release-eip` undoes it, and nothing about the instance, its volumes, its
+# security groups or its ports is touched.
+
+name: aws-assign-eip
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: "EC2 instance id (must be Name=ottoq-intel-2, a cheap type, and running)"
+        required: true
+      port:
+        description: "Port to verify reachability on after associating"
+        required: false
+        default: "8080"
+
+concurrency:
+  group: aws-assign-eip
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  IID: ${{ inputs.instance_id }}
+  PORT: ${{ inputs.port }}
+  EXPECT_NAME: ottoq-intel-2
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Guard — the intelligence box, by name AND type, and already running
+        id: guard
+        run: |
+          set -euo pipefail
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+
+          read -r name itype state <<<"$(aws ec2 describe-instances --instance-ids "${IID}" \
+            --query 'Reservations[0].Instances[0].[join(`,`,Tags[?Key==`Name`].Value),InstanceType,State.Name]' \
+            --output text)"
+          echo "target: ${IID}  name=${name}  type=${itype}  state=${state}"
+
+          if [ "${name}" != "${EXPECT_NAME}" ]; then
+            echo "::error::REFUSING: Name tag is '${name}', expected '${EXPECT_NAME}'."
+            exit 1
+          fi
+          case "${itype}" in
+            t3.*|t4g.*|m5.large) echo "type ${itype} is on the cheap allowlist." ;;
+            *)
+              echo "::error::REFUSING: instance type '${itype}' is not on the allowlist."
+              echo "This account holds g5/g6e GPU instances at \$1-\$10+/hour; two independent"
+              echo "guards exist so a mis-tagged instance cannot slip past the name check alone."
+              exit 1 ;;
+          esac
+          if [ "${state}" != "running" ]; then
+            echo "::error::REFUSING: ${IID} is ${state}, not running."
+            echo "This workflow never starts an instance. Use aws-activate-ssm for that,"
+            echo "deliberately, then re-run this."
+            exit 1
+          fi
+
+          current="$(aws ec2 describe-instances --instance-ids "${IID}" \
+                      --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+          echo "current (auto-assigned, changes on every stop/start): ${current}"
+          echo "all guards passed"
+
+      - name: Allocate or reuse an Elastic IP, and associate it
+        id: eip
+        run: |
+          set -euo pipefail
+          # IDEMPOTENT, in the order that matters. If this box already holds an Elastic IP, use it
+          # and allocate nothing -- re-running after a partial failure must not leak an address,
+          # because an unassociated Elastic IP is exactly the billing waste aws-release-eip exists
+          # to clean up.
+          mine="$(aws ec2 describe-addresses \
+                   --filters "Name=instance-id,Values=${IID}" \
+                   --query 'Addresses[0].[PublicIp,AllocationId]' --output text 2>/dev/null || true)"
+          read -r have_ip have_alloc <<<"${mine:-}"
+          if [ -n "${have_ip:-}" ] && [ "${have_ip}" != "None" ]; then
+            echo "already associated: ${have_ip} (${have_alloc}) -- allocating nothing."
+            echo "ip=${have_ip}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Next preference: an address already allocated in this account and attached to nothing.
+          # Reusing it converts billing waste into something useful rather than adding a second
+          # charge.
+          loose="$(aws ec2 describe-addresses \
+                    --query 'Addresses[?!not_null(InstanceId)]|[0].[PublicIp,AllocationId]' \
+                    --output text 2>/dev/null || true)"
+          read -r loose_ip loose_alloc <<<"${loose:-}"
+          if [ -n "${loose_ip:-}" ] && [ "${loose_ip}" != "None" ]; then
+            echo "reusing an already-allocated, unassociated address: ${loose_ip}"
+            alloc="${loose_alloc}"; ip="${loose_ip}"
+          else
+            echo "allocating a new Elastic IP (vpc domain)"
+            read -r ip alloc <<<"$(aws ec2 allocate-address --domain vpc \
+              --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=ottoq-intel-2-stable}]" \
+              --query '[PublicIp,AllocationId]' --output text)"
+            echo "allocated ${ip} (${alloc})"
+          fi
+
+          aws ec2 associate-address --instance-id "${IID}" --allocation-id "${alloc}" \
+            --query 'AssociationId' --output text
+          echo "associated ${ip} with ${IID}"
+          echo "ip=${ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Prove it is reachable FROM OUTSIDE, which also tests the security group
+        run: |
+          set -uo pipefail
+          ip="${{ steps.eip.outputs.ip }}"
+          echo "The address to put in OTTOQ_INTEL_URL is:"
+          echo
+          echo "    http://${ip}:${PORT}"
+          echo
+          # A loopback /health proves the app; only a call from off the box proves the PATH, which
+          # is the thing that was broken. The GitHub runner is as external as the Supabase edge
+          # runtime for this purpose: if the runner can reach it and the edge cannot, the cause is
+          # the configured address and not the network.
+          for i in $(seq 1 12); do
+            body="$(curl -fsS --max-time 8 "http://${ip}:${PORT}/health" 2>/dev/null || true)"
+            if [ -n "${body}" ]; then
+              echo "REACHABLE from outside after $((i*5))s:"
+              printf '  %s\n' "${body}"
+              case "${body}" in
+                *cp_sat_forward_lex*) echo "  and it lists cp_sat_forward_lex." ;;
+                *) echo "::warning::/health answered but does NOT list cp_sat_forward_lex -- the running image predates CP-SAT." ;;
+              esac
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::${ip}:${PORT} did not answer from outside within 60s."
+          echo "The association succeeded, so this is not the address moving -- it is reachability."
+          echo "In order of likelihood:"
+          echo "  - the security group does not allow inbound TCP ${PORT} from 0.0.0.0/0. That is"
+          echo "    the one inbound rule this service needs, and this workflow deliberately does"
+          echo "    NOT open ports: changing a security group is a separate, deliberate act."
+          echo "  - the container is not publishing ${PORT} (docker run -p ${PORT}:8080)."
+          echo "  - the subnet has no route to an internet gateway."
+          exit 1
