@@ -49,11 +49,15 @@ on:
         description: "EC2 instance id (must be Name=ottoq-intel-2 and a cheap type)"
         required: true
       action:
-        description: "activate = create+attach the SSM profile and start; stop = just stop it"
+        description: "activate = SSM profile + start; stop = stop it; assign_eip = give it a permanent address"
         required: true
         default: "activate"
         type: choice
-        options: [activate, stop]
+        options: [activate, stop, assign_eip]
+      port:
+        description: "assign_eip only: port to verify reachability on"
+        required: false
+        default: "8080"
 
 concurrency:
   group: aws-activate-ssm
@@ -68,6 +72,7 @@ env:
   AWS_DEFAULT_REGION: us-east-1
   IID: ${{ inputs.instance_id }}
   ACTION: ${{ inputs.action }}
+  PORT: ${{ inputs.port }}
   EXPECT_NAME: ottoq-intel-2
   ROLE_NAME: ottoq-ssm-managed
   PROFILE_NAME: ottoq-ssm-managed
@@ -106,6 +111,126 @@ jobs:
               exit 1 ;;
           esac
           echo "Both guards passed."
+
+      # ══ assign_eip — A PERMANENT ADDRESS, AND THE ROOT CAUSE OF CP-SAT NEVER BEING CALLED ══
+      #
+      # `ottoq-cpsat-propose` reads the service address from the Supabase secret OTTOQ_INTEL_URL,
+      # which is set once and never moves. This box has **no Elastic IP** (`describe-addresses` in
+      # us-east-1 returns nothing), so every stop/start hands it a different auto-assigned public
+      # IPv4. It was stopped 2026-09-21 02:52 and started again at 03:29:21, and from that moment
+      # the secret pointed at an address nothing answers on.
+      #
+      # The measurement, taken 07:15 UTC over SSM: the service's own uvicorn access log holds
+      # **zero `POST /assign` lines** since the container was built at 04:30:55, while answering
+      # /health on loopback in **14 ms** with cp_sat_forward_lex listed, at 0.14% CPU and loadavg
+      # 0.00 — a healthy, idle, correctly-built solver that has never been asked a question. From
+      # the caller's side, twelve attempts at 20005–20011 ms with http_status NULL on every one:
+      # clustered inside 6 ms of the bound, which is a connection that never completes, not a
+      # variable-difficulty solve. So the fix is not a bigger timeout; it is an address that stops
+      # moving.
+      #
+      # COST, SOURCED, because the last Elastic IP here was deleted for billing. AWS charges
+      # **$0.005 per public IPv4 address per hour, in-use or idle**, for every public IPv4 since
+      # 2024-02-01 — the same rate for an Elastic IP as for an auto-assigned one:
+      #   https://aws.amazon.com/blogs/aws/new-aws-public-ipv4-address-charge-public-ip-insights/
+      #   https://aws.amazon.com/vpc/pricing/
+      # So this REPLACES a charge rather than adding one. It also confirms releasing
+      # 54.166.168.193 was right: that one billed while attached to an instance stopped since
+      # 2026-08-15. The waste is an address with no live service behind it, not a stable address.
+      #
+      # This lives here rather than in its own file for one practical reason: a workflow_dispatch
+      # workflow must exist on the DEFAULT branch before it can be dispatched at all, and this one
+      # already does. Its stated purpose — make the intelligence box reachable — is exactly this.
+      - name: assign_eip — allocate or reuse an Elastic IP and associate it
+        if: ${{ inputs.action == 'assign_eip' }}
+        id: eip
+        run: |
+          set -euo pipefail
+          state="$(aws ec2 describe-instances --instance-ids "${IID}" \
+                    --query 'Reservations[0].Instances[0].State.Name' --output text)"
+          if [ "${state}" != "running" ]; then
+            echo "::error::REFUSING: ${IID} is ${state}, not running. Run action=activate first,"
+            echo "deliberately, then re-run this. This action never starts an instance."
+            exit 1
+          fi
+          before="$(aws ec2 describe-instances --instance-ids "${IID}" \
+                     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+          echo "current auto-assigned address (changes on every stop/start): ${before}"
+
+          # IDEMPOTENT IN THE ORDER THAT MATTERS. Re-running after a partial failure must not leak
+          # an address, because an unassociated Elastic IP is precisely the billing waste
+          # aws-release-eip exists to clean up.
+          #   1. this box already holds one -> use it, allocate nothing
+          #   2. one is allocated in this account and attached to nothing -> reuse it, converting
+          #      existing waste into something useful rather than adding a second charge
+          #   3. only then allocate a new one
+          mine="$(aws ec2 describe-addresses --filters "Name=instance-id,Values=${IID}" \
+                   --query 'Addresses[0].[PublicIp,AllocationId]' --output text 2>/dev/null || true)"
+          read -r have_ip have_alloc <<<"${mine:-}"
+          if [ -n "${have_ip:-}" ] && [ "${have_ip}" != "None" ]; then
+            echo "already associated: ${have_ip} (${have_alloc}) -- allocating nothing."
+            echo "ip=${have_ip}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          loose="$(aws ec2 describe-addresses \
+                    --query 'Addresses[?!not_null(InstanceId)]|[0].[PublicIp,AllocationId]' \
+                    --output text 2>/dev/null || true)"
+          read -r loose_ip loose_alloc <<<"${loose:-}"
+          if [ -n "${loose_ip:-}" ] && [ "${loose_ip}" != "None" ]; then
+            echo "reusing an already-allocated, unassociated address: ${loose_ip}"
+            alloc="${loose_alloc}"; ip="${loose_ip}"
+          else
+            echo "allocating a new Elastic IP (vpc domain)"
+            read -r ip alloc <<<"$(aws ec2 allocate-address --domain vpc \
+              --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=ottoq-intel-2-stable}]" \
+              --query '[PublicIp,AllocationId]' --output text)"
+            echo "allocated ${ip} (${alloc})"
+          fi
+          aws ec2 associate-address --instance-id "${IID}" --allocation-id "${alloc}" \
+            --query 'AssociationId' --output text
+          echo "associated ${ip} with ${IID}"
+          echo "ip=${ip}" >> "$GITHUB_OUTPUT"
+
+      - name: assign_eip — prove it answers FROM OUTSIDE, which also tests the security group
+        if: ${{ inputs.action == 'assign_eip' }}
+        run: |
+          set -uo pipefail
+          ip="${{ steps.eip.outputs.ip }}"
+          port="${PORT:-8080}"
+          echo "=============================================================="
+          echo " THE PERMANENT ADDRESS. Put this in the Supabase secret"
+          echo " OTTOQ_INTEL_URL and it will never need changing again:"
+          echo
+          echo "     http://${ip}:${port}"
+          echo "=============================================================="
+          echo
+          # A loopback /health proves the app; only a call from OFF the box proves the PATH, which
+          # is the part that was broken. The runner is as external as the Supabase edge runtime for
+          # this purpose: if the runner reaches it and the edge does not, the cause is the
+          # configured address, not the network.
+          for i in $(seq 1 12); do
+            body="$(curl -fsS --max-time 8 "http://${ip}:${port}/health" 2>/dev/null || true)"
+            if [ -n "${body}" ]; then
+              echo "REACHABLE from outside after $((i*5))s:"
+              printf '  %s\n' "${body}"
+              case "${body}" in
+                *cp_sat_forward_lex*) echo "  and it lists cp_sat_forward_lex." ;;
+                *) echo "::warning::/health answered but does NOT list cp_sat_forward_lex -- the running image predates CP-SAT." ;;
+              esac
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::${ip}:${port} did not answer from outside within 60s."
+          echo "The association succeeded, so this is reachability and not the address moving."
+          echo "In order of likelihood:"
+          echo "  - the security group does not allow inbound TCP ${port} from 0.0.0.0/0. That is"
+          echo "    the one inbound rule this service needs, and this workflow deliberately does"
+          echo "    NOT open ports -- editing a security group is a separate deliberate act."
+          echo "  - the container is not publishing ${port}."
+          echo "  - the subnet has no route to an internet gateway."
+          exit 1
 
       - name: Stop and exit, if that is what was asked
         if: ${{ inputs.action == 'stop' }}
