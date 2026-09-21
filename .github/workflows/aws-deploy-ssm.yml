@@ -99,40 +99,83 @@ jobs:
         id: send
         run: |
           set -euo pipefail
-          # The script below is deploy.yml's, unchanged in substance. Two deliberate
-          # differences, both because we are now INSIDE the box:
-          #   - the final /health check is the assertion, not a warm-up, and it runs against
-          #     127.0.0.1, so nothing needs port 8080 open to the internet;
-          #   - it runs as root under SSM, so it cd's to the absolute checkout path rather
-          #     than to ~ (which is /root here, not /home/ubuntu).
-          cat > /tmp/script.json <<'JSON'
-          {
-            "commands": [
-              "set -euo pipefail",
-              "export HOME=/root",
-              "CHECKOUT=\"$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence 2>/dev/null | head -1)\"",
-              "if [ -z \"${CHECKOUT:-}\" ]; then echo 'FATAL: no ottoq-intelligence checkout found on this box'; exit 1; fi",
-              "echo \"checkout: ${CHECKOUT}\"",
-              "cd \"${CHECKOUT}\"",
-              "git fetch --prune origin",
-              "git checkout __GITREF__",
-              "git reset --hard origin/__GITREF__",
-              "echo \"deploying $(git rev-parse --short HEAD)\"",
-              "TOKEN=\"$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)\"",
-              "if [ -z \"${TOKEN:-}\" ]; then echo 'FATAL: could not read OTTOQ_API_TOKEN from the running container. Refusing to redeploy without it -- a tokenless service answers 503 to everything.'; exit 1; fi",
-              "docker build -t ottoq-intel:new .",
-              "docker rm -f ottoq-intel 2>/dev/null || true",
-              "docker tag ottoq-intel:new ottoq-intel:latest",
-              "docker run -d --restart unless-stopped -p 8080:8080 -e OTTOQ_API_TOKEN=\"$TOKEN\" --name ottoq-intel ottoq-intel:latest",
-              "for i in $(seq 1 45); do curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break; sleep 2; done",
-              "BODY=\"$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)\"",
-              "echo \"HEALTH: ${BODY}\"",
-              "printf '%s' \"${BODY}\" | grep -q -- '__EXPECT__' || { echo \"FATAL: /health does not list __EXPECT__. The running image is not the build that was just deployed.\"; exit 1; }",
-              "echo \"VERIFIED: /health lists __EXPECT__\""
-            ]
-          }
-          JSON
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/script.json
+          # WHY THE SCRIPT IS SENT BASE64-ENCODED, and this is a fix rather than a flourish.
+          #
+          # Run 1 of this workflow failed in 13 seconds with the box's own stderr saying:
+          #   _script.sh: 1: set: Illegal option -o pipefail
+          # AWS-RunShellScript writes the `commands` array to a file and runs it with **/bin/sh**,
+          # which on Ubuntu is dash. `set -o pipefail` is a bash-ism, so line 1 aborted and nothing
+          # else ran. Nothing on the box was touched, because the script never reached a docker call.
+          #
+          # Dropping pipefail would have been the one-character fix and the wrong one. The script
+          # below carries a docker --format string full of `{{...}}`, nested single and double
+          # quotes, and `$(...)` — every one of which is a quoting hazard when it has to survive
+          # being embedded in a JSON array element AND re-parsed by a shell. So the script is
+          # written here as ordinary bash, encoded once, and the only thing sh ever sees is a
+          # single decode-and-run line. That removes the entire class of failure rather than this
+          # one instance of it, and it means the script running on the box is byte-identical to the
+          # script written here.
+          cat > /tmp/ottoq_deploy.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export HOME=/root
+
+          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence 2>/dev/null | head -1)"
+          if [ -z "${CHECKOUT:-}" ]; then
+            echo "FATAL: no ottoq-intelligence checkout found on this box"
+            exit 1
+          fi
+          echo "checkout: ${CHECKOUT}"
+          cd "${CHECKOUT}"
+
+          git fetch --prune origin
+          git checkout "__GITREF__"
+          git reset --hard "origin/__GITREF__"
+          echo "deploying $(git rev-parse --short HEAD)"
+
+          # Carry the running container's token forward rather than requiring it as a secret here.
+          # The service answers 503 to everything when OTTOQ_API_TOKEN is unset, so losing it on a
+          # rebuild would take the service down in a way that looks like a network fault.
+          TOKEN="$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)"
+          if [ -z "${TOKEN:-}" ]; then
+            echo "FATAL: could not read OTTOQ_API_TOKEN from the running container."
+            echo "Refusing to redeploy without it -- a tokenless service answers 503 to everything."
+            exit 1
+          fi
+
+          # Temporary tag, so a build failure leaves the CURRENT container running and serving.
+          docker build -t ottoq-intel:new .
+
+          docker rm -f ottoq-intel 2>/dev/null || true
+          docker tag ottoq-intel:new ottoq-intel:latest
+          docker run -d --restart unless-stopped -p 8080:8080 \
+            -e OTTOQ_API_TOKEN="${TOKEN}" \
+            --name ottoq-intel ottoq-intel:latest
+
+          for i in $(seq 1 45); do
+            curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          BODY="$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)"
+          echo "HEALTH: ${BODY}"
+          if ! printf '%s' "${BODY}" | grep -q -- '__EXPECT__'; then
+            echo "FATAL: /health does not list __EXPECT__. The running image is not the build just deployed."
+            exit 1
+          fi
+          echo "VERIFIED: /health lists __EXPECT__"
+          docker image prune -f >/dev/null 2>&1 || true
+          SH
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/ottoq_deploy.sh
+          bash -n /tmp/ottoq_deploy.sh && echo "script parses as bash"
+
+          B64="$(base64 -w0 /tmp/ottoq_deploy.sh)" python3 - > /tmp/params.json <<'PY'
+          import json, os
+          # One sh-safe line. No quotes from the script survive into it at all.
+          line = ("echo " + os.environ["B64"]
+                  + " | base64 -d > /tmp/ottoq_deploy.sh && bash /tmp/ottoq_deploy.sh")
+          print(json.dumps({"commands": [line]}))
+          PY
 
           cid="$(aws ssm send-command \
                   --instance-ids "${IID}" \
@@ -140,14 +183,15 @@ jobs:
                   --comment "ottoq-intelligence rebuild via aws-deploy-ssm" \
                   --timeout-seconds 1200 \
                   --cloud-watch-output-config CloudWatchOutputEnabled=false \
-                  --parameters file:///tmp/script.json \
+                  --parameters file:///tmp/params.json \
                   --query 'Command.CommandId' --output text)"
           echo "command id: ${cid}"
           echo "cid=${cid}" >> "$GITHUB_OUTPUT"
 
-          # Poll rather than `aws ssm wait`, so the status is visible while it runs: a docker
-          # build takes minutes and a silent wait is indistinguishable from a hang.
-          for i in $(seq 1 120); do
+          # Poll rather than `aws ssm wait`, so status is visible while it runs: a docker build
+          # takes minutes and a silent wait is indistinguishable from a hang.
+          st=Pending
+          for i in $(seq 1 150); do
             st="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
                    --query Status --output text 2>/dev/null || echo Pending)"
             case "${st}" in
