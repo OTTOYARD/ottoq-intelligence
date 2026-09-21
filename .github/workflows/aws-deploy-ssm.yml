@@ -52,6 +52,12 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      rollback:
+        description: "Restore the most recent /opt/ottoq_backup_* tree and rebuild from it"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
   # Two concurrent deploys would race on the container name. Never cancel in progress: a
@@ -71,12 +77,22 @@ env:
   GITREF: ${{ inputs.git_ref }}
   EXPECT_NAME: ottoq-intel-2
   DISCOVER_ONLY: ${{ inputs.discover_only }}
+  ROLLBACK: ${{ inputs.rollback }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     steps:
+      - name: Check out the ref being deployed
+        # NEW: the box has no git checkout (run 4's discovery), so the SOURCE has to come from
+        # here. Previously this workflow ran `git fetch && reset --hard` on the box, which could
+        # never have worked: /opt/ottoq holds the full tree but no .git anywhere on the host.
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 1
+
       - name: Guard — the target must be the intelligence box, and SSM must already reach it
         run: |
           set -euo pipefail
@@ -122,6 +138,17 @@ jobs:
           # single decode-and-run line. That removes the entire class of failure rather than this
           # one instance of it, and it means the script running on the box is byte-identical to the
           # script written here.
+          # Build the payload the box will extract. --exclude __pycache__: stale .pyc compiled
+          # against the old tree is exactly what makes a deploy look applied and behave otherwise.
+          # --sort=name and a fixed mtime so the same ref produces the same bytes, which makes the
+          # digest below a meaningful identity rather than a per-run nonce.
+          tar czf /tmp/ottoq_src.tgz --exclude='__pycache__' --sort=name \
+              --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              app Dockerfile requirements.txt
+          SRC_SHA="$(sha256sum /tmp/ottoq_src.tgz | cut -d' ' -f1)"
+          GITSHA="$(git rev-parse HEAD)"
+          echo "shipping $(wc -c < /tmp/ottoq_src.tgz) bytes, sha256 ${SRC_SHA}, commit ${GITSHA}"
+
           cat > /tmp/ottoq_deploy.sh <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -145,8 +172,17 @@ jobs:
           done
           echo "git checkouts found anywhere shallow:"
           find / -maxdepth 4 -type d -name '.git' 2>/dev/null | head -10 | sed 's|/.git$||' | sed 's/^/  /' || true
-          echo "docker ps:"
-          docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          # `docker ps` alone HID THE THING THAT MATTERED after run 7: it lists only RUNNING
+          # containers, so a crash-looping one is invisible exactly when you most need to see it.
+          # -a, the state detail, and the container's own logs are what say why.
+          echo "docker ps -a:"
+          docker ps -a --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          echo "container state:"
+          docker inspect ottoq-intel \
+            --format '  status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} err={{.State.Error}}' \
+            2>/dev/null || echo "  (no container named ottoq-intel)"
+          echo "container logs (last 40 lines) -- THE REASON IT DID NOT COME UP:"
+          docker logs ottoq-intel --tail 40 2>&1 | sed 's/^/  /' || echo "  (no logs)"
           echo "docker images:"
           docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
           echo "local /health right now:"
@@ -164,26 +200,113 @@ jobs:
             exit 0
           fi
 
-          # `|| true` INSIDE the substitution: see the comment above. Without it pipefail hands
-          # ls's exit 2 to set -e and the script dies before reporting anything at all.
-          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence /opt/ottoq-intelligence /srv/ottoq-intelligence 2>/dev/null | head -1 || true)"
+          # ── FIND THE TREE BY WHAT IT CONTAINS, NOT BY WHAT IT IS CALLED. ──
+          # Run 6 shipped the source perfectly (DECODED_SRC 23085 bytes, byte-exact) and then still
+          # said "no checkout found", because this locator searched for a directory NAMED
+          # `ottoq-intelligence` and the one on the box is **/opt/ottoq**. The discovery block had
+          # printed that path, and I had written it into the commit message and the PR body, and
+          # still left the search looking for the other name. Identify a thing by what it IS.
+          #
+          # The signature is a Dockerfile beside app/main.py — the two files this deploy actually
+          # needs. A directory that has both is the tree we build, whatever it is called; one that
+          # lacks either is not, however promising its name.
+          CHECKOUT=""
+          for d in /opt/ottoq /opt/ottoq-intelligence /srv/ottoq /srv/ottoq-intelligence \
+                   /root/ottoq /root/ottoq-intelligence /home/*/ottoq /home/*/ottoq-intelligence; do
+            if [ -f "${d}/Dockerfile" ] && [ -f "${d}/app/main.py" ]; then CHECKOUT="${d}"; break; fi
+          done
           if [ -z "${CHECKOUT:-}" ]; then
-            CHECKOUT="$(find / -maxdepth 5 -type d -name 'ottoq-intelligence' 2>/dev/null | head -1 || true)"
+            # `|| true` INSIDE the substitution: without it pipefail hands find's exit status to
+            # set -e and the script dies before reporting anything, which is how run 3 failed.
+            CHECKOUT="$(find / -maxdepth 6 -path '*/app/main.py' 2>/dev/null | head -1 \
+                        | sed 's|/app/main.py$||' || true)"
+            [ -n "${CHECKOUT:-}" ] && [ ! -f "${CHECKOUT}/Dockerfile" ] && CHECKOUT=""
           fi
           if [ -z "${CHECKOUT:-}" ]; then
-            echo "FATAL: no ottoq-intelligence checkout found on this box."
+            echo "FATAL: no directory on this box holds both a Dockerfile and app/main.py."
             echo "The discovery block above says what IS here. Read that rather than re-running:"
-            echo "if the service was deployed from an image built elsewhere, there is no checkout to"
-            echo "pull and this workflow is the wrong shape for that box."
+            echo "if the service was deployed from an image built elsewhere, there is no tree to"
+            echo "update in place and this workflow is the wrong shape for that box."
             exit 1
           fi
-          echo "checkout: ${CHECKOUT}"
+          echo "checkout: ${CHECKOUT} (identified by Dockerfile + app/main.py)"
           cd "${CHECKOUT}"
 
-          git fetch --prune origin
-          git checkout "__GITREF__"
-          git reset --hard "origin/__GITREF__"
-          echo "deploying $(git rev-parse --short HEAD)"
+          # ── THE SOURCE ARRIVES AS A TARBALL, because this box has no git. ──
+          # Run 4's discovery: /opt/ottoq holds the full tree (app/, Dockerfile, requirements.txt,
+          # tests/) but there is NO .git anywhere on the host, so the `git fetch && reset --hard`
+          # this block used to contain could never have worked. The July image was built from that
+          # tree and the tree never moved again.
+          #
+          # The whole clean tree ships rather than a hand-picked delta. It is 23 KB gzipped, 32 KB
+          # base64 — well inside SSM's parameter budget — and shipping all of it removes the risk
+          # of omitting a file CP-SAT needs. __pycache__ is excluded: stale .pyc files compiled
+          # against the old tree are exactly the kind of thing that makes a deploy look applied
+          # and behave otherwise.
+          # ── ROLLBACK: restore the newest backup tree and rebuild from it. ──
+          # Run 7 built and ran a new image that never answered on 8080, and because the old
+          # container is removed before the new one starts, that leaves the service down. The
+          # temporary image tag protects against a BUILD failure; it does nothing about an image
+          # that builds and then will not serve. This is the path back.
+          if [ "__ROLLBACK__" = "true" ]; then
+            BK="$(ls -1d /opt/ottoq_backup_* 2>/dev/null | sort | tail -1 || true)"
+            if [ -z "${BK:-}" ]; then
+              echo "FATAL: no /opt/ottoq_backup_* to roll back to. Nothing changed."
+              exit 1
+            fi
+            echo "rolling back from ${BK}"
+            cp -a "${BK}/app" "${BK}/Dockerfile" "${BK}/requirements.txt" "${CHECKOUT}/"
+            rm -f "${CHECKOUT}/.deployed_sha"
+            TOKEN="$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)"
+            if [ -z "${TOKEN:-}" ]; then
+              echo "FATAL: cannot read OTTOQ_API_TOKEN from the container; refusing to rebuild tokenless."
+              exit 1
+            fi
+            docker build -t ottoq-intel:rollback .
+            docker rm -f ottoq-intel 2>/dev/null || true
+            docker tag ottoq-intel:rollback ottoq-intel:latest
+            docker run -d --restart unless-stopped -p 8080:8080 \
+              -e OTTOQ_API_TOKEN="${TOKEN}" --name ottoq-intel ottoq-intel:latest
+            for i in $(seq 1 45); do
+              curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+              sleep 2
+            done
+            echo "post-rollback /health: $(curl -fsS --max-time 10 http://127.0.0.1:8080/health 2>&1 || echo NO_ANSWER)"
+            echo "ROLLBACK COMPLETE from ${BK}"
+            exit 0
+          fi
+
+          if [ ! -f /tmp/ottoq_src.tgz ]; then
+            echo "FATAL: /tmp/ottoq_src.tgz was not delivered. Nothing has been changed."
+            exit 1
+          fi
+          got="$(sha256sum /tmp/ottoq_src.tgz | cut -d" " -f1)"
+          if [ "${got}" != "__SRC_SHA__" ]; then
+            echo "FATAL: shipped tarball digest mismatch."
+            echo "  expected __SRC_SHA__"
+            echo "  got      ${got}"
+            echo "The transfer was truncated or corrupted. NOTHING has been extracted -- the"
+            echo "running container is untouched. Re-run; do not extract a partial tree."
+            exit 1
+          fi
+          echo "tarball digest verified: ${got}"
+
+          # A backup, because the temporary image tag protects the RUNNING container but not the
+          # ability to rebuild the previous one. Timestamped so repeated deploys do not overwrite
+          # the only copy of a known-good tree.
+          BACKUP="/opt/ottoq_backup_$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "${BACKUP}"
+          cp -a app Dockerfile requirements.txt "${BACKUP}/" 2>/dev/null || true
+          echo "previous tree backed up to ${BACKUP}"
+
+          tar xzf /tmp/ottoq_src.tgz -C "${CHECKOUT}"
+          echo "extracted __GITREF__ (__SRC_SHA_SHORT__) into ${CHECKOUT}"
+
+          # THE BOX HAD NO WAY TO SAY WHICH COMMIT IT WAS RUNNING, and that is precisely how a
+          # pre-CP-SAT image served for five days unnoticed. It does now.
+          printf '%s\n' "__GITSHA__" > "${CHECKOUT}/.deployed_sha"
+          printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) __GITREF__ __GITSHA__" >> "${CHECKOUT}/.deploy_history"
+          echo "recorded deployed sha: __GITSHA__"
 
           # Carry the running container's token forward rather than requiring it as a secret here.
           # The service answers 503 to everything when OTTOQ_API_TOKEN is unset, so losing it on a
@@ -218,7 +341,13 @@ jobs:
           echo "VERIFIED: /health lists __EXPECT__"
           docker image prune -f >/dev/null 2>&1 || true
           SH
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g" /tmp/ottoq_deploy.sh
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g; s|__ROLLBACK__|${ROLLBACK}|g; s|__SRC_SHA__|${SRC_SHA}|g; s|__SRC_SHA_SHORT__|${SRC_SHA:0:12}|g; s|__GITSHA__|${GITSHA}|g" /tmp/ottoq_deploy.sh
+          for ph in __GITREF__ __EXPECT__ __DISCOVER_ONLY__ __SRC_SHA__ __GITSHA__ __ROLLBACK__; do
+            if grep -q -- "${ph}" /tmp/ottoq_deploy.sh; then
+              echo "::error::placeholder ${ph} was not substituted; refusing to send."
+              exit 1
+            fi
+          done
           bash -n /tmp/ottoq_deploy.sh && echo "script parses as bash"
 
           # RUN 2 FAILED WITH NO OUTPUT AT ALL -- stderr was just "failed to run commands: exit
@@ -233,20 +362,30 @@ jobs:
           # count, DECODED with a byte count, then the script's own output. Base64's alphabet has
           # no single quotes, so single-quoting each chunk is safe by construction.
           python3 - > /tmp/params.json <<'PY'
-          import base64, json, textwrap
-          raw = open('/tmp/ottoq_deploy.sh', 'rb').read()
-          b64 = base64.b64encode(raw).decode()
-          chunks = textwrap.wrap(b64, 700)
-          cmds = ["echo BEGIN", "rm -f /tmp/ottoq_deploy.b64"]
-          for c in chunks:
-              cmds.append("printf '%s' '" + c + "' >> /tmp/ottoq_deploy.b64")
-          cmds += [
-              'echo "WROTE_B64 $(wc -c < /tmp/ottoq_deploy.b64) bytes"',
-              "base64 -d /tmp/ottoq_deploy.b64 > /tmp/ottoq_deploy.sh",
-              'echo "DECODED $(wc -c < /tmp/ottoq_deploy.sh) bytes"',
-              "command -v bash || echo NO_BASH_ON_PATH",
-              "bash /tmp/ottoq_deploy.sh",
-          ]
+          import base64, json, os, textwrap
+
+          def chunked(path, dest, label):
+              """Emit sh-safe lines that rebuild `path` at `dest` on the box.
+
+              Base64's alphabet holds no single quotes, so single-quoting each chunk is safe by
+              construction rather than by luck. printf rather than echo: dash's echo interprets
+              backslashes and a 32 KB single argument is not worth the doubt.
+              """
+              b64 = base64.b64encode(open(path, 'rb').read()).decode()
+              out = ["rm -f %s.b64" % dest]
+              for c in textwrap.wrap(b64, 700):
+                  out.append("printf '%s' '" + c + "' >> " + dest + ".b64")
+              out.append('echo "WROTE_%s $(wc -c < %s.b64) bytes"' % (label, dest))
+              out.append("base64 -d %s.b64 > %s" % (dest, dest))
+              out.append('echo "DECODED_%s $(wc -c < %s) bytes"' % (label, dest))
+              return out
+
+          cmds = ["echo BEGIN"]
+          # The SOURCE first: if it is truncated the script refuses to extract, and refusing
+          # before touching anything is worth more than failing halfway through.
+          cmds += chunked('/tmp/ottoq_src.tgz', '/tmp/ottoq_src.tgz', 'SRC')
+          cmds += chunked('/tmp/ottoq_deploy.sh', '/tmp/ottoq_deploy.sh', 'SCRIPT')
+          cmds += ["command -v bash || echo NO_BASH_ON_PATH", "bash /tmp/ottoq_deploy.sh"]
           print(json.dumps({"commands": cmds}))
           PY
           echo "payload: $(python3 -c "import json;print(len(json.load(open('/tmp/params.json'))['commands']),'commands')")"
@@ -255,7 +394,7 @@ jobs:
                   --instance-ids "${IID}" \
                   --document-name AWS-RunShellScript \
                   --comment "ottoq-intelligence rebuild via aws-deploy-ssm" \
-                  --timeout-seconds 1200 \
+                  --timeout-seconds 600 \
                   --cloud-watch-output-config CloudWatchOutputEnabled=false \
                   --parameters file:///tmp/params.json \
                   --query 'Command.CommandId' --output text)"
@@ -264,8 +403,19 @@ jobs:
 
           # Poll rather than `aws ssm wait`, so status is visible while it runs: a docker build
           # takes minutes and a silent wait is indistinguishable from a hang.
+          #
+          # THE BUDGET, corrected after run 7. `--timeout-seconds` above is SSM's DELIVERY timeout
+          # — how long it waits for the agent to pick the command up — not the execution timeout,
+          # which for AWS-RunShellScript defaults to an hour. I had set delivery to 1200 believing
+          # it bounded the build, and polled for only 1500s. Run 7's OR-Tools build on a t3.medium
+          # was still going at 24 minutes, so the loop would have exhausted while the command was
+          # legitimately running and the next step would have called it FAILED. **A timeout of my
+          # patience is not a build failure**, and reporting it as one is the same class of defect
+          # as a success line that proves nothing. Delivery is now 600s (if the agent has not taken
+          # it in ten minutes, something is wrong with the agent) and the poll budget is 55 minutes,
+          # inside the job's 70-minute ceiling.
           st=Pending
-          for i in $(seq 1 150); do
+          for i in $(seq 1 330); do
             st="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
                    --query Status --output text 2>/dev/null || echo Pending)"
             case "${st}" in
@@ -292,18 +442,41 @@ jobs:
       - name: Fail the workflow if the box failed
         run: |
           st="${{ steps.send.outputs.final_status }}"
-          if [ "${st}" != "Success" ]; then
-            echo "::error::the rebuild did not succeed on the box (status: ${st})."
-            echo "The stdout/stderr above is from the box itself -- read that, not this line."
-            exit 1
-          fi
+          cid="${{ steps.send.outputs.cid }}"
+          case "${st}" in
+            Success) : ;;
+            InProgress|Pending|Delayed)
+              # Run 7 is why this branch exists. The command had not finished when the poll budget
+              # ran out; calling that a failure would blame the box for my impatience, and would
+              # also hide the fact that the build may still be about to succeed.
+              echo "::warning::the rebuild is STILL RUNNING on the box (status: ${st})."
+              echo "This workflow stopped waiting; it did not fail. The command is unaffected."
+              echo "Check it with:  aws ssm get-command-invocation --command-id ${cid} --instance-id ${IID}"
+              echo "or re-run this workflow once it has finished -- every step is idempotent, and the"
+              echo "digest check refuses to extract a tree that is already identical in content."
+              exit 1 ;;
+            *)
+              echo "::error::the rebuild did not succeed on the box (status: ${st})."
+              echo "The stdout/stderr above is from the box itself -- read that, not this line."
+              exit 1 ;;
+          esac
           # DISCOVER_ONLY exits 0 without ever reaching the health assertion, and run 5 printed
           # "rebuild succeeded and /health lists cp_sat_forward_lex" anyway -- a success line
           # claiming a check that had been skipped. That is precisely the defect this workflow
           # exists to catch in the service (a 200 that proves nothing), committed by the workflow
           # itself. So the claim is now conditional on having actually made it.
+          # THE THIRD TIME THIS LINE HAS CLAIMED SOMETHING IT DID NOT CHECK, so it now enumerates
+          # every path instead of assuming the default one. Run 5 printed "rebuild succeeded and
+          # /health lists cp_sat_forward_lex" after a discovery that deployed nothing; run 10
+          # printed the same after a ROLLBACK, which restores the tree that has no CP-SAT in it at
+          # all. Each time the fix covered the case in front of me and left the next one. An
+          # exhaustive case is the fix; a third patch to the same `else` would not be.
           if [ "${DISCOVER_ONLY}" = "true" ]; then
             echo "discovery completed. NOTHING was deployed and NO health assertion was made."
+          elif [ "${ROLLBACK}" = "true" ]; then
+            echo "ROLLBACK completed. The PREVIOUS tree is restored and rebuilt -- it does NOT"
+            echo "contain ${EXPECT}, and no assertion about ${EXPECT} was made. Read the"
+            echo "post-rollback /health line above for what the service is actually serving."
           else
             echo "rebuild succeeded and /health lists ${EXPECT}"
           fi
