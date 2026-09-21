@@ -3,6 +3,12 @@
 **Who this is for:** Chase, or anyone non-technical. Every step says what to click, what to
 copy and where to paste it. **Nothing here needs a terminal.** Written 2026-09-20.
 
+
+> **SUPERSEDED — read `ACTIVATE_AWS_ACCESS.md` instead.** Chase has AWS Activate credits, so the
+> AWS route is funded and strictly less work: **two** values instead of three, **no `.pem` key file
+> to hunt for**, no security group to edit, and no port left open to the internet. This file is
+> kept only as the fallback if AWS access cannot be granted for some reason.
+
 **Time:** about 20 minutes, most of it hunting for one file on your computer.
 
 **You do this once, ever.** After it works, every future code change deploys itself.
