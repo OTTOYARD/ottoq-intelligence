@@ -465,8 +465,18 @@ jobs:
           # claiming a check that had been skipped. That is precisely the defect this workflow
           # exists to catch in the service (a 200 that proves nothing), committed by the workflow
           # itself. So the claim is now conditional on having actually made it.
+          # THE THIRD TIME THIS LINE HAS CLAIMED SOMETHING IT DID NOT CHECK, so it now enumerates
+          # every path instead of assuming the default one. Run 5 printed "rebuild succeeded and
+          # /health lists cp_sat_forward_lex" after a discovery that deployed nothing; run 10
+          # printed the same after a ROLLBACK, which restores the tree that has no CP-SAT in it at
+          # all. Each time the fix covered the case in front of me and left the next one. An
+          # exhaustive case is the fix; a third patch to the same `else` would not be.
           if [ "${DISCOVER_ONLY}" = "true" ]; then
             echo "discovery completed. NOTHING was deployed and NO health assertion was made."
+          elif [ "${ROLLBACK}" = "true" ]; then
+            echo "ROLLBACK completed. The PREVIOUS tree is restored and rebuilt -- it does NOT"
+            echo "contain ${EXPECT}, and no assertion about ${EXPECT} was made. Read the"
+            echo "post-rollback /health line above for what the service is actually serving."
           else
             echo "rebuild succeeded and /health lists ${EXPECT}"
           fi
