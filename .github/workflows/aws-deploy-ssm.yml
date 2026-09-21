@@ -187,24 +187,34 @@ jobs:
           docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
           echo "local /health right now:"
           curl -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | sed 's/^/  /' || echo "  (no answer on 8080)"
-          # ── WHY THE LAST BUILD REFUSED TO START, without touching the running service. ──
-          # The rollback replaced the crashed container, so its logs are gone -- a real cost of
-          # restoring service, and the reason this reproduces the failure from the IMAGE instead.
-          # `ottoq-intel:new` is still on the box. Importing app.main inside a throwaway container
-          # prints the FULL traceback, including the underlying ImportError that assignment_cpsat
-          # converts into "otto-q-core is unavailable" and that a 40-line log tail cut off.
-          # --rm, no port binding, no name collision, no volume: it cannot disturb what is serving.
-          if docker image inspect ottoq-intel:new >/dev/null 2>&1; then
-            echo "import probe on ottoq-intel:new (throwaway container, nothing else touched):"
-            docker run --rm --entrypoint python ottoq-intel:new -c 'import app.main' 2>&1 \
-              | tail -30 | sed 's/^/  /' || true
-            echo "  (a clean exit above means the image imports fine and the failure was elsewhere)"
-            echo "OTTOQ_CORE_ROOT and the core checkout inside that image:"
-            docker run --rm --entrypoint sh ottoq-intel:new -c \
-              'echo "  OTTOQ_CORE_ROOT=$OTTOQ_CORE_ROOT"; ls -d "$OTTOQ_CORE_ROOT" 2>/dev/null || echo "  (absent)"; ls "$OTTOQ_CORE_ROOT/bridge" 2>/dev/null | head -5 | sed "s/^/    /" || echo "    (no bridge/)"' 2>&1 || true
-          else
-            echo "ottoq-intel:new is not present; nothing to probe."
-          fi
+          # ── DOES THE AGENT CHAIN'S REQUEST EVEN ARRIVE? The one question that separates a
+          # network problem from a compute problem, and it is answerable from uvicorn's own
+          # access log. On 2026-09-21 07:10 the edge function recorded /assign as
+          # "Signal timed out." after 20,006 ms with NO http_status, which is what BOTH causes
+          # look like from the caller's side: a request that never landed and a request that
+          # landed and was still solving are indistinguishable from a client that gave up.
+          #   POST /assign lines present  -> it arrives; the box is too slow (compute)
+          #   POST /assign lines absent   -> it never arrives (URL, security group, or the
+          #                                  public IP changed when the box was restarted)
+          echo "has the box RECEIVED /assign requests? (uvicorn access log)"
+          docker logs ottoq-intel 2>&1 | grep -c 'POST /assign' | sed 's/^/  POST \/assign lines: /' || echo "  (grep failed)"
+          docker logs ottoq-intel 2>&1 | grep 'POST /assign' | tail -5 | sed 's/^/    /' || true
+          echo "  (for contrast, /health lines: )"
+          docker logs ottoq-intel 2>&1 | grep -c 'GET /health' | sed 's/^/    /' || true
+          # CPU is the other half of "too slow". A t3.medium is BURSTABLE: once the credit
+          # balance is spent it throttles to a fraction of 2 vCPU, and OR-Tools is the most
+          # CPU-hungry thing on this box. A load average above the core count with the
+          # container using ~100% of one core is that state.
+          echo "cpu and load (t3.medium is burstable -- throttling is a real cause of >20s):"
+          echo "  nproc=$(nproc 2>/dev/null)  loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+          docker stats --no-stream --format '  {{.Name}}  cpu={{.CPUPerc}}  mem={{.MemUsage}}' 2>/dev/null || true
+          # And time /health from the box itself, where the network is not a variable. A slow
+          # /health on localhost means the process is starved, not that the path is long.
+          echo "timed local /health (loopback, so network is out of the picture):"
+          s=$(date +%s%N)
+          curl -fsS --max-time 30 http://127.0.0.1:8080/health >/dev/null 2>&1 && ok=yes || ok=no
+          e=$(date +%s%N)
+          echo "  answered=${ok} in $(( (e - s) / 1000000 ))ms"
           echo "/opt/ottoq tree (2 levels):"
           find /opt/ottoq -maxdepth 2 2>/dev/null | head -40 | sed 's/^/  /' || echo "  (absent)"
           echo "Dockerfile / requirements anywhere shallow:"
