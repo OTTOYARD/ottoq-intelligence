@@ -169,13 +169,35 @@ jobs:
           sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/ottoq_deploy.sh
           bash -n /tmp/ottoq_deploy.sh && echo "script parses as bash"
 
-          B64="$(base64 -w0 /tmp/ottoq_deploy.sh)" python3 - > /tmp/params.json <<'PY'
-          import json, os
-          # One sh-safe line. No quotes from the script survive into it at all.
-          line = ("echo " + os.environ["B64"]
-                  + " | base64 -d > /tmp/ottoq_deploy.sh && bash /tmp/ottoq_deploy.sh")
-          print(json.dumps({"commands": [line]}))
+          # RUN 2 FAILED WITH NO OUTPUT AT ALL -- stderr was just "failed to run commands: exit
+          # status 2" and stdout was empty. That is worse than run 1's failure, which at least
+          # named its cause: a single decode-and-run line gives the box nowhere to report from, so
+          # I could not tell whether base64 or bash had failed. **Fixing the diagnostic is the
+          # first job here, not the deploy.**
+          #
+          # So the payload is now a LIST of sh-safe lines, each leaving a breadcrumb on stdout, and
+          # the base64 is written in chunks with printf rather than one enormous echo argument.
+          # Whatever fails next, the breadcrumbs say how far it got: BEGIN, WROTE_B64 with a byte
+          # count, DECODED with a byte count, then the script's own output. Base64's alphabet has
+          # no single quotes, so single-quoting each chunk is safe by construction.
+          python3 - > /tmp/params.json <<'PY'
+          import base64, json, textwrap
+          raw = open('/tmp/ottoq_deploy.sh', 'rb').read()
+          b64 = base64.b64encode(raw).decode()
+          chunks = textwrap.wrap(b64, 700)
+          cmds = ["echo BEGIN", "rm -f /tmp/ottoq_deploy.b64"]
+          for c in chunks:
+              cmds.append("printf '%s' '" + c + "' >> /tmp/ottoq_deploy.b64")
+          cmds += [
+              'echo "WROTE_B64 $(wc -c < /tmp/ottoq_deploy.b64) bytes"',
+              "base64 -d /tmp/ottoq_deploy.b64 > /tmp/ottoq_deploy.sh",
+              'echo "DECODED $(wc -c < /tmp/ottoq_deploy.sh) bytes"',
+              "command -v bash || echo NO_BASH_ON_PATH",
+              "bash /tmp/ottoq_deploy.sh",
+          ]
+          print(json.dumps({"commands": cmds}))
           PY
+          echo "payload: $(python3 -c "import json;print(len(json.load(open('/tmp/params.json'))['commands']),'commands')")"
 
           cid="$(aws ssm send-command \
                   --instance-ids "${IID}" \
