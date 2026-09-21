@@ -46,6 +46,12 @@ on:
         description: "Git ref to deploy on the box"
         required: false
         default: "main"
+      discover_only:
+        description: "Report what is on the box and stop -- changes nothing"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
   # Two concurrent deploys would race on the container name. Never cancel in progress: a
@@ -64,6 +70,7 @@ env:
   EXPECT: ${{ inputs.expect_optimizer }}
   GITREF: ${{ inputs.git_ref }}
   EXPECT_NAME: ottoq-intel-2
+  DISCOVER_ONLY: ${{ inputs.discover_only }}
 
 jobs:
   deploy:
@@ -144,7 +151,18 @@ jobs:
           docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
           echo "local /health right now:"
           curl -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | sed 's/^/  /' || echo "  (no answer on 8080)"
+          echo "/opt/ottoq tree (2 levels):"
+          find /opt/ottoq -maxdepth 2 2>/dev/null | head -40 | sed 's/^/  /' || echo "  (absent)"
+          echo "Dockerfile / requirements anywhere shallow:"
+          find / -maxdepth 5 \( -name Dockerfile -o -name requirements.txt \) 2>/dev/null | head -10 | sed 's/^/  /' || true
+          echo "how the container was started:"
+          docker inspect ottoq-intel --format '  image={{.Config.Image}} created={{.Created}} cmd={{json .Config.Cmd}}' 2>/dev/null || true
+          docker inspect ottoq-intel --format '  mounts={{json .Mounts}}' 2>/dev/null || true
           echo "--- end discovery ---"
+          if [ "__DISCOVER_ONLY__" = "true" ]; then
+            echo "DISCOVER_ONLY: stopping here. Nothing was changed."
+            exit 0
+          fi
 
           # `|| true` INSIDE the substitution: see the comment above. Without it pipefail hands
           # ls's exit 2 to set -e and the script dies before reporting anything at all.
@@ -200,7 +218,7 @@ jobs:
           echo "VERIFIED: /health lists __EXPECT__"
           docker image prune -f >/dev/null 2>&1 || true
           SH
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/ottoq_deploy.sh
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g" /tmp/ottoq_deploy.sh
           bash -n /tmp/ottoq_deploy.sh && echo "script parses as bash"
 
           # RUN 2 FAILED WITH NO OUTPUT AT ALL -- stderr was just "failed to run commands: exit
