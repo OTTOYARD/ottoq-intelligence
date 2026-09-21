@@ -52,6 +52,12 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      rollback:
+        description: "Restore the most recent /opt/ottoq_backup_* tree and rebuild from it"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
   # Two concurrent deploys would race on the container name. Never cancel in progress: a
@@ -71,6 +77,7 @@ env:
   GITREF: ${{ inputs.git_ref }}
   EXPECT_NAME: ottoq-intel-2
   DISCOVER_ONLY: ${{ inputs.discover_only }}
+  ROLLBACK: ${{ inputs.rollback }}
 
 jobs:
   deploy:
@@ -165,8 +172,17 @@ jobs:
           done
           echo "git checkouts found anywhere shallow:"
           find / -maxdepth 4 -type d -name '.git' 2>/dev/null | head -10 | sed 's|/.git$||' | sed 's/^/  /' || true
-          echo "docker ps:"
-          docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          # `docker ps` alone HID THE THING THAT MATTERED after run 7: it lists only RUNNING
+          # containers, so a crash-looping one is invisible exactly when you most need to see it.
+          # -a, the state detail, and the container's own logs are what say why.
+          echo "docker ps -a:"
+          docker ps -a --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          echo "container state:"
+          docker inspect ottoq-intel \
+            --format '  status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} err={{.State.Error}}' \
+            2>/dev/null || echo "  (no container named ottoq-intel)"
+          echo "container logs (last 40 lines) -- THE REASON IT DID NOT COME UP:"
+          docker logs ottoq-intel --tail 40 2>&1 | sed 's/^/  /' || echo "  (no logs)"
           echo "docker images:"
           docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
           echo "local /health right now:"
@@ -227,6 +243,39 @@ jobs:
           # of omitting a file CP-SAT needs. __pycache__ is excluded: stale .pyc files compiled
           # against the old tree are exactly the kind of thing that makes a deploy look applied
           # and behave otherwise.
+          # ── ROLLBACK: restore the newest backup tree and rebuild from it. ──
+          # Run 7 built and ran a new image that never answered on 8080, and because the old
+          # container is removed before the new one starts, that leaves the service down. The
+          # temporary image tag protects against a BUILD failure; it does nothing about an image
+          # that builds and then will not serve. This is the path back.
+          if [ "__ROLLBACK__" = "true" ]; then
+            BK="$(ls -1d /opt/ottoq_backup_* 2>/dev/null | sort | tail -1 || true)"
+            if [ -z "${BK:-}" ]; then
+              echo "FATAL: no /opt/ottoq_backup_* to roll back to. Nothing changed."
+              exit 1
+            fi
+            echo "rolling back from ${BK}"
+            cp -a "${BK}/app" "${BK}/Dockerfile" "${BK}/requirements.txt" "${CHECKOUT}/"
+            rm -f "${CHECKOUT}/.deployed_sha"
+            TOKEN="$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)"
+            if [ -z "${TOKEN:-}" ]; then
+              echo "FATAL: cannot read OTTOQ_API_TOKEN from the container; refusing to rebuild tokenless."
+              exit 1
+            fi
+            docker build -t ottoq-intel:rollback .
+            docker rm -f ottoq-intel 2>/dev/null || true
+            docker tag ottoq-intel:rollback ottoq-intel:latest
+            docker run -d --restart unless-stopped -p 8080:8080 \
+              -e OTTOQ_API_TOKEN="${TOKEN}" --name ottoq-intel ottoq-intel:latest
+            for i in $(seq 1 45); do
+              curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+              sleep 2
+            done
+            echo "post-rollback /health: $(curl -fsS --max-time 10 http://127.0.0.1:8080/health 2>&1 || echo NO_ANSWER)"
+            echo "ROLLBACK COMPLETE from ${BK}"
+            exit 0
+          fi
+
           if [ ! -f /tmp/ottoq_src.tgz ]; then
             echo "FATAL: /tmp/ottoq_src.tgz was not delivered. Nothing has been changed."
             exit 1
@@ -292,8 +341,8 @@ jobs:
           echo "VERIFIED: /health lists __EXPECT__"
           docker image prune -f >/dev/null 2>&1 || true
           SH
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g; s|__SRC_SHA__|${SRC_SHA}|g; s|__SRC_SHA_SHORT__|${SRC_SHA:0:12}|g; s|__GITSHA__|${GITSHA}|g" /tmp/ottoq_deploy.sh
-          for ph in __GITREF__ __EXPECT__ __DISCOVER_ONLY__ __SRC_SHA__ __GITSHA__; do
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g; s|__ROLLBACK__|${ROLLBACK}|g; s|__SRC_SHA__|${SRC_SHA}|g; s|__SRC_SHA_SHORT__|${SRC_SHA:0:12}|g; s|__GITSHA__|${GITSHA}|g" /tmp/ottoq_deploy.sh
+          for ph in __GITREF__ __EXPECT__ __DISCOVER_ONLY__ __SRC_SHA__ __GITSHA__ __ROLLBACK__; do
             if grep -q -- "${ph}" /tmp/ottoq_deploy.sh; then
               echo "::error::placeholder ${ph} was not substituted; refusing to send."
               exit 1
