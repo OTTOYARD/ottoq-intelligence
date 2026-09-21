@@ -1,0 +1,182 @@
+# aws-deploy-ssm — rebuild the intelligence service over AWS Systems Manager, and PROVE the new
+# image is the one now serving. This is deploy.yml's job done without SSH.
+#
+# WHY IT REPLACES deploy.yml RATHER THAN SITTING BESIDE IT.
+#
+# deploy.yml works, and it needs three things this does not: a private key in a repository
+# secret, port 22 reachable from a GitHub-hosted runner's dynamic IP, and port 8080 reachable
+# from that runner too — because its final assertion curls `/health` from the OUTSIDE. Those
+# three requirements are why it was never activated: `deploy/DEPLOY_EC2.md` had the operator
+# restrict port 22 to "My IP", so GitHub was turned away at the door.
+#
+# Over SSM none of that applies. The box needs **no inbound rules at all** — the agent dials
+# out to the SSM endpoints on 443 — and there is no key material anywhere in this repository.
+#
+# AND THE HEALTH ASSERTION GETS STRICTLY BETTER, which is the part worth noticing. deploy.yml
+# asserts against `http://EC2_HOST:8080/health`, from the runner, which requires 8080 open to
+# the internet. Here the same assertion runs ON the box against 127.0.0.1, so the strongest
+# check in the pipeline stops depending on the weakest part of the network posture.
+#
+# THE ASSERTION ITSELF IS UNCHANGED AND IS THE POINT. It checks that `/health` lists the
+# expected optimizer, not that it returns 200. A 200 proves the box is up and proves nothing
+# about which build is on it — and that is exactly how a pre-CP-SAT image served happily for
+# five days while the twin's edge function correctly refused its output as "an invalid proposer
+# envelope". Commit 7923cf9 added app/optimizers/assignment_cpsat.py AND changed Dockerfile and
+# requirements.txt, so the running image physically could not serve CP-SAT. Nothing was broken
+# except that the image predated the feature.
+#
+# PREREQUISITE: the instance must be SSM-managed. `aws-activate-ssm.yml` does that, and
+# confirmed it on 2026-09-21 — i-01500ed2fddc67c66 reported Online in 20s, Ubuntu 24.04, agent
+# 3.3.4793.0. If SSM cannot reach the box this workflow fails immediately and says so, rather
+# than timing out somewhere useful-looking.
+
+name: aws-deploy-ssm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: "EC2 instance id (must be Name=ottoq-intel-2)"
+        required: true
+      expect_optimizer:
+        description: "Optimizer name that /health must list after the deploy"
+        required: false
+        default: "cp_sat_forward_lex"
+      git_ref:
+        description: "Git ref to deploy on the box"
+        required: false
+        default: "main"
+
+concurrency:
+  # Two concurrent deploys would race on the container name. Never cancel in progress: a
+  # half-replaced container is worse than a queued deploy. Same reasoning as deploy.yml.
+  group: deploy-intelligence
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  IID: ${{ inputs.instance_id }}
+  EXPECT: ${{ inputs.expect_optimizer }}
+  GITREF: ${{ inputs.git_ref }}
+  EXPECT_NAME: ottoq-intel-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Guard — the target must be the intelligence box, and SSM must already reach it
+        run: |
+          set -euo pipefail
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+
+          # Same name guard as aws-activate-ssm. A deploy is less dangerous than a start, but
+          # running a docker build on the wrong box is still not something to do by typo.
+          name="$(aws ec2 describe-instances --instance-ids "${IID}" \
+                   --query 'Reservations[0].Instances[0].join(`,`,Tags[?Key==`Name`].Value)' --output text)"
+          if [ "${name}" != "${EXPECT_NAME}" ]; then
+            echo "::error::REFUSING: Name tag is '${name}', expected '${EXPECT_NAME}'."
+            exit 1
+          fi
+
+          ping="$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${IID}" \
+                   --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+          if [ "${ping}" != "Online" ]; then
+            echo "::error::SSM reports PingStatus '${ping}' for ${IID}, not Online."
+            echo "Run aws-activate-ssm.yml first: it attaches the instance profile and starts the box."
+            echo "Failing here rather than sending a command that would sit queued until it expired."
+            exit 1
+          fi
+          echo "guards passed; SSM is Online for ${IID}"
+
+      - name: Send the rebuild, and wait for it
+        id: send
+        run: |
+          set -euo pipefail
+          # The script below is deploy.yml's, unchanged in substance. Two deliberate
+          # differences, both because we are now INSIDE the box:
+          #   - the final /health check is the assertion, not a warm-up, and it runs against
+          #     127.0.0.1, so nothing needs port 8080 open to the internet;
+          #   - it runs as root under SSM, so it cd's to the absolute checkout path rather
+          #     than to ~ (which is /root here, not /home/ubuntu).
+          cat > /tmp/script.json <<'JSON'
+          {
+            "commands": [
+              "set -euo pipefail",
+              "export HOME=/root",
+              "CHECKOUT=\"$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence 2>/dev/null | head -1)\"",
+              "if [ -z \"${CHECKOUT:-}\" ]; then echo 'FATAL: no ottoq-intelligence checkout found on this box'; exit 1; fi",
+              "echo \"checkout: ${CHECKOUT}\"",
+              "cd \"${CHECKOUT}\"",
+              "git fetch --prune origin",
+              "git checkout __GITREF__",
+              "git reset --hard origin/__GITREF__",
+              "echo \"deploying $(git rev-parse --short HEAD)\"",
+              "TOKEN=\"$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)\"",
+              "if [ -z \"${TOKEN:-}\" ]; then echo 'FATAL: could not read OTTOQ_API_TOKEN from the running container. Refusing to redeploy without it -- a tokenless service answers 503 to everything.'; exit 1; fi",
+              "docker build -t ottoq-intel:new .",
+              "docker rm -f ottoq-intel 2>/dev/null || true",
+              "docker tag ottoq-intel:new ottoq-intel:latest",
+              "docker run -d --restart unless-stopped -p 8080:8080 -e OTTOQ_API_TOKEN=\"$TOKEN\" --name ottoq-intel ottoq-intel:latest",
+              "for i in $(seq 1 45); do curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break; sleep 2; done",
+              "BODY=\"$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)\"",
+              "echo \"HEALTH: ${BODY}\"",
+              "printf '%s' \"${BODY}\" | grep -q -- '__EXPECT__' || { echo \"FATAL: /health does not list __EXPECT__. The running image is not the build that was just deployed.\"; exit 1; }",
+              "echo \"VERIFIED: /health lists __EXPECT__\""
+            ]
+          }
+          JSON
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/script.json
+
+          cid="$(aws ssm send-command \
+                  --instance-ids "${IID}" \
+                  --document-name AWS-RunShellScript \
+                  --comment "ottoq-intelligence rebuild via aws-deploy-ssm" \
+                  --timeout-seconds 1200 \
+                  --cloud-watch-output-config CloudWatchOutputEnabled=false \
+                  --parameters file:///tmp/script.json \
+                  --query 'Command.CommandId' --output text)"
+          echo "command id: ${cid}"
+          echo "cid=${cid}" >> "$GITHUB_OUTPUT"
+
+          # Poll rather than `aws ssm wait`, so the status is visible while it runs: a docker
+          # build takes minutes and a silent wait is indistinguishable from a hang.
+          for i in $(seq 1 120); do
+            st="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
+                   --query Status --output text 2>/dev/null || echo Pending)"
+            case "${st}" in
+              Success|Failed|Cancelled|TimedOut) echo "status: ${st}"; break ;;
+              *) echo "  ... ${st} ($((i*10))s)"; sleep 10 ;;
+            esac
+          done
+          echo "final_status=${st}" >> "$GITHUB_OUTPUT"
+
+      - name: Print what the box said, whatever happened
+        if: always()
+        run: |
+          set -uo pipefail
+          cid="${{ steps.send.outputs.cid }}"
+          [ -z "${cid}" ] && { echo "no command was sent"; exit 0; }
+          echo "=== stdout ==="
+          aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
+            --query StandardOutputContent --output text 2>/dev/null || true
+          echo
+          echo "=== stderr ==="
+          aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
+            --query StandardErrorContent --output text 2>/dev/null || true
+
+      - name: Fail the workflow if the box failed
+        run: |
+          st="${{ steps.send.outputs.final_status }}"
+          if [ "${st}" != "Success" ]; then
+            echo "::error::the rebuild did not succeed on the box (status: ${st})."
+            echo "The stdout/stderr above is from the box itself -- read that, not this line."
+            exit 1
+          fi
+          echo "rebuild succeeded and /health lists ${EXPECT}"
