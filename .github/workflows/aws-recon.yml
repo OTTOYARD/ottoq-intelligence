@@ -135,6 +135,26 @@ jobs:
             echo "Compare the IamProfileArn column in step 2: a 'None' there is the reason."
           fi
 
+      - name: 3b. When each instance was last stopped, and where the loose IPs are
+        run: |
+          set -uo pipefail
+          # WHY THIS STEP EXISTS. The first recon run found every instance STOPPED, which
+          # contradicts otto-q-core FINDINGS.md G105 -- that says the intelligence service is "up
+          # and healthy" serving a pre-CP-SAT image, measured from the twin side during run
+          # c9b0a87e (2026-09-21 01:23-02:32 UTC). A stopped box serves nothing, so one of those
+          # two things is wrong and the StateTransitionReason carries the timestamp that decides
+          # it. Separately, 98.93.216.144 appears in deploy/ACTIVATE_DEPLOY.md and matched no
+          # instance, so the Elastic IP list is where that address has to be if it is ours at all.
+          for r in us-east-1 us-east-2; do
+            echo "=== ${r} : instance timing ==="
+            aws ec2 describe-instances --region "$r"               --query 'Reservations[].Instances[].[InstanceId,join(`,`,Tags[?Key==`Name`].Value),State.Name,StateTransitionReason,LaunchTime]'               --output text 2>/dev/null | sed 's/^/  /' || true
+            echo
+            echo "=== ${r} : Elastic IPs ==="
+            aws ec2 describe-addresses --region "$r"               --query 'Addresses[].[PublicIp,InstanceId,AssociationId,Domain]'               --output text 2>/dev/null | sed 's/^/  /' || true
+            echo
+          done
+          echo "An Elastic IP with no InstanceId is allocated and unassociated -- it still bills."
+
       - name: 4. What the recon concludes
         run: |
           echo "Read-only recon complete. Nothing in the account was modified."

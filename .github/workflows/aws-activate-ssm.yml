@@ -1,0 +1,233 @@
+# aws-activate-ssm — make the intelligence box reachable by AWS Systems Manager, and start it.
+#
+# THIS IS THE FIRST WORKFLOW HERE THAT MUTATES ANYTHING. Everything it does is reversible, it
+# touches exactly one instance, and it refuses to touch any other.
+#
+# WHAT aws-recon.yml ESTABLISHED (run 2, 2026-09-21 03:25 UTC):
+#   - the credentials are valid, as user `ottoq-automation`
+#   - all five instances live in us-east-1 and ALL FIVE ARE STOPPED
+#   - the intelligence box is `i-01500ed2fddc67c66`, Name tag `ottoq-intel-2`, a t3.medium,
+#     launched 2026-09-20 14:33 UTC and stopped "User initiated (2026-09-21 02:52:02 GMT)"
+#   - EVERY instance has IamInstanceProfile = None, which is exactly why
+#     `ssm describe-instance-information` returns nothing in any region
+#
+# So two things are missing and this fixes both: an instance profile granting
+# AmazonSSMManagedInstanceCore, and the instance being switched on.
+#
+# ══ THE GUARDS, AND WHY EACH ONE IS HERE ═══════════════════════════════════
+#
+# The account holds THREE GPU instances — g5.xlarge, g6e.xlarge and two g5.2xlarge — which run
+# from about $1/hour to well over $10/hour. Starting one by accident is the single most expensive
+# mistake available in this account, and the standing commitment in deploy/ACTIVATE_AWS_ACCESS.md
+# Part 7 is that no GPU instance is ever launched without the operator being asked first, with
+# its hourly cost stated. So this workflow does not merely avoid them, it is built so that it
+# CANNOT reach them:
+#
+#   1. The instance id is a required input with no default. Nothing runs implicitly.
+#   2. The instance's Name tag must equal `ottoq-intel-2` exactly, or the job fails before any
+#      mutation. An id typo lands on a name mismatch rather than on a GPU box.
+#   3. The instance type must appear in an allowlist of cheap types (t3.*, t4g.*, m5.large).
+#      A g5/g6e type fails the check by construction, whatever the name says.
+#   4. Guards 2 and 3 are independent and BOTH must pass, because either alone could be defeated
+#      by a mis-tagged instance.
+#
+# Reversibility: creating an IAM role and instance profile, associating it, and starting a
+# t3.medium are each undone by deleting/disassociating/stopping. Nothing is terminated, no volume
+# is touched, no security group is edited, and no port is opened.
+#
+# COST. A t3.medium in us-east-1 is about $0.042/hour, roughly $30/month if left running. That
+# figure was given to the operator in the runbook before these credentials existed. This workflow
+# starts the box and leaves it running, because the twin needs it reachable; `stop` is a separate
+# dispatch of this same workflow.
+
+name: aws-activate-ssm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: "EC2 instance id (must be Name=ottoq-intel-2 and a cheap type)"
+        required: true
+      action:
+        description: "activate = create+attach the SSM profile and start; stop = just stop it"
+        required: true
+        default: "activate"
+        type: choice
+        options: [activate, stop]
+
+concurrency:
+  group: aws-activate-ssm
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  IID: ${{ inputs.instance_id }}
+  ACTION: ${{ inputs.action }}
+  EXPECT_NAME: ottoq-intel-2
+  ROLE_NAME: ottoq-ssm-managed
+  PROFILE_NAME: ottoq-ssm-managed
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Guard — the target must be the intelligence box, by name AND by type
+        run: |
+          set -euo pipefail
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+
+          read -r name itype state <<<"$(aws ec2 describe-instances --instance-ids "${IID}" \
+            --query 'Reservations[0].Instances[0].[join(`,`,Tags[?Key==`Name`].Value),InstanceType,State.Name]' \
+            --output text)"
+          echo "target: ${IID}  name=${name}  type=${itype}  state=${state}"
+
+          if [ "${name}" != "${EXPECT_NAME}" ]; then
+            echo "::error::REFUSING: Name tag is '${name}', expected '${EXPECT_NAME}'."
+            echo "This workflow only ever touches the intelligence box. If the box was renamed,"
+            echo "change EXPECT_NAME deliberately in a commit rather than passing a different id."
+            exit 1
+          fi
+
+          case "${itype}" in
+            t3.*|t4g.*|m5.large) echo "type ${itype} is on the cheap allowlist." ;;
+            *)
+              echo "::error::REFUSING: instance type '${itype}' is not on the allowlist."
+              echo "This account holds g5/g6e GPU instances costing \$1-\$10+/hour. The standing"
+              echo "commitment is that no GPU instance is started without the operator being asked"
+              echo "first, with its hourly cost stated. Two independent guards exist precisely so a"
+              echo "mis-tagged instance cannot slip past the name check alone."
+              exit 1 ;;
+          esac
+          echo "Both guards passed."
+
+      - name: Stop and exit, if that is what was asked
+        if: ${{ inputs.action == 'stop' }}
+        run: |
+          set -euo pipefail
+          aws ec2 stop-instances --instance-ids "${IID}" \
+            --query 'StoppingInstances[0].[InstanceId,CurrentState.Name,PreviousState.Name]' --output text
+          echo "Stop requested. A stopped t3.medium costs almost nothing; its EBS volume still bills."
+
+      - name: 1. The SSM role and instance profile, created only if absent
+        if: ${{ inputs.action == 'activate' }}
+        run: |
+          set -euo pipefail
+          # Idempotent throughout: every create is guarded by a get, so re-running this workflow
+          # after a partial failure is safe and is the intended recovery path.
+          if aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
+            echo "role ${ROLE_NAME} already exists."
+          else
+            echo "creating role ${ROLE_NAME}"
+            aws iam create-role --role-name "${ROLE_NAME}" \
+              --description "Lets EC2 instances be managed by AWS Systems Manager. Created by ottoq-intelligence aws-activate-ssm." \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": {"Service": "ec2.amazonaws.com"},
+                  "Action": "sts:AssumeRole"
+                }]
+              }' >/dev/null
+          fi
+
+          # AmazonSSMManagedInstanceCore is the AWS-managed policy for exactly this and nothing
+          # more: it permits the SSM agent to register and receive commands. It grants no access
+          # to other services, so the box gets no new reach into the account.
+          aws iam attach-role-policy --role-name "${ROLE_NAME}" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          echo "AmazonSSMManagedInstanceCore attached."
+
+          if aws iam get-instance-profile --instance-profile-name "${PROFILE_NAME}" >/dev/null 2>&1; then
+            echo "instance profile ${PROFILE_NAME} already exists."
+          else
+            aws iam create-instance-profile --instance-profile-name "${PROFILE_NAME}" >/dev/null
+            echo "created instance profile ${PROFILE_NAME}"
+          fi
+
+          if aws iam get-instance-profile --instance-profile-name "${PROFILE_NAME}" \
+               --query 'InstanceProfile.Roles[].RoleName' --output text | grep -qx "${ROLE_NAME}"; then
+            echo "role already in the profile."
+          else
+            aws iam add-role-to-instance-profile --instance-profile-name "${PROFILE_NAME}" \
+              --role-name "${ROLE_NAME}"
+            echo "role added to the profile."
+            # IAM is eventually consistent: an instance profile is not immediately usable by EC2
+            # after the role is added, and associating too early fails with an unhelpful error.
+            sleep 15
+          fi
+
+      - name: 2. Associate the profile with the instance
+        if: ${{ inputs.action == 'activate' }}
+        run: |
+          set -euo pipefail
+          existing="$(aws ec2 describe-iam-instance-profile-associations \
+            --filters "Name=instance-id,Values=${IID}" \
+            --query 'IamInstanceProfileAssociations[?State!=`disassociated`].[AssociationId,IamInstanceProfile.Arn]' \
+            --output text || true)"
+          if [ -n "${existing}" ] && [ "${existing}" != "None" ]; then
+            echo "an association already exists: ${existing}"
+            echo "leaving it alone -- replacing an association this workflow did not create is not"
+            echo "its business, and the recon said there was none."
+          else
+            aws ec2 associate-iam-instance-profile \
+              --instance-id "${IID}" \
+              --iam-instance-profile "Name=${PROFILE_NAME}" \
+              --query 'IamInstanceProfileAssociation.[AssociationId,State]' --output text
+            echo "associated."
+          fi
+
+      - name: 3. Start the instance
+        if: ${{ inputs.action == 'activate' }}
+        run: |
+          set -euo pipefail
+          state="$(aws ec2 describe-instances --instance-ids "${IID}" \
+                    --query 'Reservations[0].Instances[0].State.Name' --output text)"
+          if [ "${state}" = "running" ]; then
+            echo "already running."
+          else
+            echo "starting ${IID} (t3.medium, about \$0.042/hour)"
+            aws ec2 start-instances --instance-ids "${IID}" \
+              --query 'StartingInstances[0].[InstanceId,CurrentState.Name]' --output text
+            aws ec2 wait instance-running --instance-ids "${IID}"
+            echo "running."
+          fi
+          aws ec2 describe-instances --instance-ids "${IID}" \
+            --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress,PrivateIpAddress]' \
+            --output text
+
+      - name: 4. Wait for SSM to register it, and say plainly if it does not
+        if: ${{ inputs.action == 'activate' }}
+        run: |
+          set -uo pipefail
+          # The agent registers a minute or two after boot. This polls rather than sleeping a flat
+          # interval, so a fast registration is not paid for.
+          for i in $(seq 1 24); do
+            ping="$(aws ssm describe-instance-information \
+                     --filters "Key=InstanceIds,Values=${IID}" \
+                     --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+            if [ "${ping}" = "Online" ]; then
+              echo "SSM reports ${IID} Online after $((i*10))s."
+              aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${IID}" \
+                --query 'InstanceInformationList[0].[InstanceId,PingStatus,PlatformName,PlatformVersion,AgentVersion]' \
+                --output text
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSM did not report this instance Online within 240s."
+          echo "The two usual causes, in order of likelihood:"
+          echo "  - the SSM agent is not installed or not running on the box. Ubuntu AMIs ship it,"
+          echo "    but an image built before it was standard will not have it, and it cannot be"
+          echo "    installed without a way in -- which is the thing we are trying to create."
+          echo "  - the instance has no route to the SSM endpoints (no public IP and no NAT, or"
+          echo "    egress blocked). Check the subnet's route table and the security group's"
+          echo "    OUTBOUND rules; SSM needs outbound 443 and no inbound at all."
+          echo "Neither is fixed by re-running this workflow. Report it rather than retrying."
+          exit 1
