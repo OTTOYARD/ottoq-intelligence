@@ -187,6 +187,24 @@ jobs:
           docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
           echo "local /health right now:"
           curl -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | sed 's/^/  /' || echo "  (no answer on 8080)"
+          # ── WHY THE LAST BUILD REFUSED TO START, without touching the running service. ──
+          # The rollback replaced the crashed container, so its logs are gone -- a real cost of
+          # restoring service, and the reason this reproduces the failure from the IMAGE instead.
+          # `ottoq-intel:new` is still on the box. Importing app.main inside a throwaway container
+          # prints the FULL traceback, including the underlying ImportError that assignment_cpsat
+          # converts into "otto-q-core is unavailable" and that a 40-line log tail cut off.
+          # --rm, no port binding, no name collision, no volume: it cannot disturb what is serving.
+          if docker image inspect ottoq-intel:new >/dev/null 2>&1; then
+            echo "import probe on ottoq-intel:new (throwaway container, nothing else touched):"
+            docker run --rm --entrypoint python ottoq-intel:new -c 'import app.main' 2>&1 \
+              | tail -30 | sed 's/^/  /' || true
+            echo "  (a clean exit above means the image imports fine and the failure was elsewhere)"
+            echo "OTTOQ_CORE_ROOT and the core checkout inside that image:"
+            docker run --rm --entrypoint sh ottoq-intel:new -c \
+              'echo "  OTTOQ_CORE_ROOT=$OTTOQ_CORE_ROOT"; ls -d "$OTTOQ_CORE_ROOT" 2>/dev/null || echo "  (absent)"; ls "$OTTOQ_CORE_ROOT/bridge" 2>/dev/null | head -5 | sed "s/^/    /" || echo "    (no bridge/)"' 2>&1 || true
+          else
+            echo "ottoq-intel:new is not present; nothing to probe."
+          fi
           echo "/opt/ottoq tree (2 levels):"
           find /opt/ottoq -maxdepth 2 2>/dev/null | head -40 | sed 's/^/  /' || echo "  (absent)"
           echo "Dockerfile / requirements anywhere shallow:"
