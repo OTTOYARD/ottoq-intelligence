@@ -46,6 +46,12 @@ on:
         description: "Git ref to deploy on the box"
         required: false
         default: "main"
+      discover_only:
+        description: "Report what is on the box and stop -- changes nothing"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
   # Two concurrent deploys would race on the container name. Never cancel in progress: a
@@ -64,6 +70,7 @@ env:
   EXPECT: ${{ inputs.expect_optimizer }}
   GITREF: ${{ inputs.git_ref }}
   EXPECT_NAME: ottoq-intel-2
+  DISCOVER_ONLY: ${{ inputs.discover_only }}
 
 jobs:
   deploy:
@@ -99,40 +106,150 @@ jobs:
         id: send
         run: |
           set -euo pipefail
-          # The script below is deploy.yml's, unchanged in substance. Two deliberate
-          # differences, both because we are now INSIDE the box:
-          #   - the final /health check is the assertion, not a warm-up, and it runs against
-          #     127.0.0.1, so nothing needs port 8080 open to the internet;
-          #   - it runs as root under SSM, so it cd's to the absolute checkout path rather
-          #     than to ~ (which is /root here, not /home/ubuntu).
-          cat > /tmp/script.json <<'JSON'
-          {
-            "commands": [
-              "set -euo pipefail",
-              "export HOME=/root",
-              "CHECKOUT=\"$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence 2>/dev/null | head -1)\"",
-              "if [ -z \"${CHECKOUT:-}\" ]; then echo 'FATAL: no ottoq-intelligence checkout found on this box'; exit 1; fi",
-              "echo \"checkout: ${CHECKOUT}\"",
-              "cd \"${CHECKOUT}\"",
-              "git fetch --prune origin",
-              "git checkout __GITREF__",
-              "git reset --hard origin/__GITREF__",
-              "echo \"deploying $(git rev-parse --short HEAD)\"",
-              "TOKEN=\"$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)\"",
-              "if [ -z \"${TOKEN:-}\" ]; then echo 'FATAL: could not read OTTOQ_API_TOKEN from the running container. Refusing to redeploy without it -- a tokenless service answers 503 to everything.'; exit 1; fi",
-              "docker build -t ottoq-intel:new .",
-              "docker rm -f ottoq-intel 2>/dev/null || true",
-              "docker tag ottoq-intel:new ottoq-intel:latest",
-              "docker run -d --restart unless-stopped -p 8080:8080 -e OTTOQ_API_TOKEN=\"$TOKEN\" --name ottoq-intel ottoq-intel:latest",
-              "for i in $(seq 1 45); do curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break; sleep 2; done",
-              "BODY=\"$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)\"",
-              "echo \"HEALTH: ${BODY}\"",
-              "printf '%s' \"${BODY}\" | grep -q -- '__EXPECT__' || { echo \"FATAL: /health does not list __EXPECT__. The running image is not the build that was just deployed.\"; exit 1; }",
-              "echo \"VERIFIED: /health lists __EXPECT__\""
-            ]
-          }
-          JSON
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g" /tmp/script.json
+          # WHY THE SCRIPT IS SENT BASE64-ENCODED, and this is a fix rather than a flourish.
+          #
+          # Run 1 of this workflow failed in 13 seconds with the box's own stderr saying:
+          #   _script.sh: 1: set: Illegal option -o pipefail
+          # AWS-RunShellScript writes the `commands` array to a file and runs it with **/bin/sh**,
+          # which on Ubuntu is dash. `set -o pipefail` is a bash-ism, so line 1 aborted and nothing
+          # else ran. Nothing on the box was touched, because the script never reached a docker call.
+          #
+          # Dropping pipefail would have been the one-character fix and the wrong one. The script
+          # below carries a docker --format string full of `{{...}}`, nested single and double
+          # quotes, and `$(...)` — every one of which is a quoting hazard when it has to survive
+          # being embedded in a JSON array element AND re-parsed by a shell. So the script is
+          # written here as ordinary bash, encoded once, and the only thing sh ever sees is a
+          # single decode-and-run line. That removes the entire class of failure rather than this
+          # one instance of it, and it means the script running on the box is byte-identical to the
+          # script written here.
+          cat > /tmp/ottoq_deploy.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export HOME=/root
+
+          # ── DISCOVERY FIRST, and it exists because of how run 3 failed. ──
+          # Run 3's breadcrumbs read: BEGIN / WROTE_B64 2512 / DECODED 1882 / /usr/bin/bash, then
+          # SILENCE and exit 2. The script died before its own first echo, and the cause was mine:
+          # `ls -d <nonexistent>` exits 2, and with `set -e` plus `pipefail` that killed the script
+          # BEFORE the `if` written to report it. The guard I added to make failures loud is what
+          # made this one invisible. Two lessons, both encoded below:
+          #   - a command substitution whose failure you intend to HANDLE needs `|| true` inside it,
+          #     or pipefail hands it to set -e first;
+          #   - and I was guessing the checkout path. So now the box is asked rather than assumed,
+          #     and it reports unconditionally, before anything can fail.
+          echo "--- discovery ---"
+          echo "whoami: $(whoami 2>/dev/null || true)  home: ${HOME:-unset}"
+          echo "candidate dirs:"
+          for d in /home/* /root /opt /srv /var/www; do
+            [ -d "$d" ] && echo "  $d: $(ls -A "$d" 2>/dev/null | head -8 | tr '\n' ' ')"
+          done
+          echo "git checkouts found anywhere shallow:"
+          find / -maxdepth 4 -type d -name '.git' 2>/dev/null | head -10 | sed 's|/.git$||' | sed 's/^/  /' || true
+          echo "docker ps:"
+          docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          echo "docker images:"
+          docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
+          echo "local /health right now:"
+          curl -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | sed 's/^/  /' || echo "  (no answer on 8080)"
+          echo "/opt/ottoq tree (2 levels):"
+          find /opt/ottoq -maxdepth 2 2>/dev/null | head -40 | sed 's/^/  /' || echo "  (absent)"
+          echo "Dockerfile / requirements anywhere shallow:"
+          find / -maxdepth 5 \( -name Dockerfile -o -name requirements.txt \) 2>/dev/null | head -10 | sed 's/^/  /' || true
+          echo "how the container was started:"
+          docker inspect ottoq-intel --format '  image={{.Config.Image}} created={{.Created}} cmd={{json .Config.Cmd}}' 2>/dev/null || true
+          docker inspect ottoq-intel --format '  mounts={{json .Mounts}}' 2>/dev/null || true
+          echo "--- end discovery ---"
+          if [ "__DISCOVER_ONLY__" = "true" ]; then
+            echo "DISCOVER_ONLY: stopping here. Nothing was changed."
+            exit 0
+          fi
+
+          # `|| true` INSIDE the substitution: see the comment above. Without it pipefail hands
+          # ls's exit 2 to set -e and the script dies before reporting anything at all.
+          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence /opt/ottoq-intelligence /srv/ottoq-intelligence 2>/dev/null | head -1 || true)"
+          if [ -z "${CHECKOUT:-}" ]; then
+            CHECKOUT="$(find / -maxdepth 5 -type d -name 'ottoq-intelligence' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${CHECKOUT:-}" ]; then
+            echo "FATAL: no ottoq-intelligence checkout found on this box."
+            echo "The discovery block above says what IS here. Read that rather than re-running:"
+            echo "if the service was deployed from an image built elsewhere, there is no checkout to"
+            echo "pull and this workflow is the wrong shape for that box."
+            exit 1
+          fi
+          echo "checkout: ${CHECKOUT}"
+          cd "${CHECKOUT}"
+
+          git fetch --prune origin
+          git checkout "__GITREF__"
+          git reset --hard "origin/__GITREF__"
+          echo "deploying $(git rev-parse --short HEAD)"
+
+          # Carry the running container's token forward rather than requiring it as a secret here.
+          # The service answers 503 to everything when OTTOQ_API_TOKEN is unset, so losing it on a
+          # rebuild would take the service down in a way that looks like a network fault.
+          TOKEN="$(docker inspect ottoq-intel --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OTTOQ_API_TOKEN=//p' | head -1 || true)"
+          if [ -z "${TOKEN:-}" ]; then
+            echo "FATAL: could not read OTTOQ_API_TOKEN from the running container."
+            echo "Refusing to redeploy without it -- a tokenless service answers 503 to everything."
+            exit 1
+          fi
+
+          # Temporary tag, so a build failure leaves the CURRENT container running and serving.
+          docker build -t ottoq-intel:new .
+
+          docker rm -f ottoq-intel 2>/dev/null || true
+          docker tag ottoq-intel:new ottoq-intel:latest
+          docker run -d --restart unless-stopped -p 8080:8080 \
+            -e OTTOQ_API_TOKEN="${TOKEN}" \
+            --name ottoq-intel ottoq-intel:latest
+
+          for i in $(seq 1 45); do
+            curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          BODY="$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)"
+          echo "HEALTH: ${BODY}"
+          if ! printf '%s' "${BODY}" | grep -q -- '__EXPECT__'; then
+            echo "FATAL: /health does not list __EXPECT__. The running image is not the build just deployed."
+            exit 1
+          fi
+          echo "VERIFIED: /health lists __EXPECT__"
+          docker image prune -f >/dev/null 2>&1 || true
+          SH
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g" /tmp/ottoq_deploy.sh
+          bash -n /tmp/ottoq_deploy.sh && echo "script parses as bash"
+
+          # RUN 2 FAILED WITH NO OUTPUT AT ALL -- stderr was just "failed to run commands: exit
+          # status 2" and stdout was empty. That is worse than run 1's failure, which at least
+          # named its cause: a single decode-and-run line gives the box nowhere to report from, so
+          # I could not tell whether base64 or bash had failed. **Fixing the diagnostic is the
+          # first job here, not the deploy.**
+          #
+          # So the payload is now a LIST of sh-safe lines, each leaving a breadcrumb on stdout, and
+          # the base64 is written in chunks with printf rather than one enormous echo argument.
+          # Whatever fails next, the breadcrumbs say how far it got: BEGIN, WROTE_B64 with a byte
+          # count, DECODED with a byte count, then the script's own output. Base64's alphabet has
+          # no single quotes, so single-quoting each chunk is safe by construction.
+          python3 - > /tmp/params.json <<'PY'
+          import base64, json, textwrap
+          raw = open('/tmp/ottoq_deploy.sh', 'rb').read()
+          b64 = base64.b64encode(raw).decode()
+          chunks = textwrap.wrap(b64, 700)
+          cmds = ["echo BEGIN", "rm -f /tmp/ottoq_deploy.b64"]
+          for c in chunks:
+              cmds.append("printf '%s' '" + c + "' >> /tmp/ottoq_deploy.b64")
+          cmds += [
+              'echo "WROTE_B64 $(wc -c < /tmp/ottoq_deploy.b64) bytes"',
+              "base64 -d /tmp/ottoq_deploy.b64 > /tmp/ottoq_deploy.sh",
+              'echo "DECODED $(wc -c < /tmp/ottoq_deploy.sh) bytes"',
+              "command -v bash || echo NO_BASH_ON_PATH",
+              "bash /tmp/ottoq_deploy.sh",
+          ]
+          print(json.dumps({"commands": cmds}))
+          PY
+          echo "payload: $(python3 -c "import json;print(len(json.load(open('/tmp/params.json'))['commands']),'commands')")"
 
           cid="$(aws ssm send-command \
                   --instance-ids "${IID}" \
@@ -140,14 +257,15 @@ jobs:
                   --comment "ottoq-intelligence rebuild via aws-deploy-ssm" \
                   --timeout-seconds 1200 \
                   --cloud-watch-output-config CloudWatchOutputEnabled=false \
-                  --parameters file:///tmp/script.json \
+                  --parameters file:///tmp/params.json \
                   --query 'Command.CommandId' --output text)"
           echo "command id: ${cid}"
           echo "cid=${cid}" >> "$GITHUB_OUTPUT"
 
-          # Poll rather than `aws ssm wait`, so the status is visible while it runs: a docker
-          # build takes minutes and a silent wait is indistinguishable from a hang.
-          for i in $(seq 1 120); do
+          # Poll rather than `aws ssm wait`, so status is visible while it runs: a docker build
+          # takes minutes and a silent wait is indistinguishable from a hang.
+          st=Pending
+          for i in $(seq 1 150); do
             st="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
                    --query Status --output text 2>/dev/null || echo Pending)"
             case "${st}" in
@@ -179,4 +297,13 @@ jobs:
             echo "The stdout/stderr above is from the box itself -- read that, not this line."
             exit 1
           fi
-          echo "rebuild succeeded and /health lists ${EXPECT}"
+          # DISCOVER_ONLY exits 0 without ever reaching the health assertion, and run 5 printed
+          # "rebuild succeeded and /health lists cp_sat_forward_lex" anyway -- a success line
+          # claiming a check that had been skipped. That is precisely the defect this workflow
+          # exists to catch in the service (a 200 that proves nothing), committed by the workflow
+          # itself. So the claim is now conditional on having actually made it.
+          if [ "${DISCOVER_ONLY}" = "true" ]; then
+            echo "discovery completed. NOTHING was deployed and NO health assertion was made."
+          else
+            echo "rebuild succeeded and /health lists ${EXPECT}"
+          fi
