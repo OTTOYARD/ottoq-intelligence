@@ -297,4 +297,13 @@ jobs:
             echo "The stdout/stderr above is from the box itself -- read that, not this line."
             exit 1
           fi
-          echo "rebuild succeeded and /health lists ${EXPECT}"
+          # DISCOVER_ONLY exits 0 without ever reaching the health assertion, and run 5 printed
+          # "rebuild succeeded and /health lists cp_sat_forward_lex" anyway -- a success line
+          # claiming a check that had been skipped. That is precisely the defect this workflow
+          # exists to catch in the service (a 200 that proves nothing), committed by the workflow
+          # itself. So the claim is now conditional on having actually made it.
+          if [ "${DISCOVER_ONLY}" = "true" ]; then
+            echo "discovery completed. NOTHING was deployed and NO health assertion was made."
+          else
+            echo "rebuild succeeded and /health lists ${EXPECT}"
+          fi
