@@ -120,9 +120,43 @@ jobs:
           set -euo pipefail
           export HOME=/root
 
-          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence 2>/dev/null | head -1)"
+          # ── DISCOVERY FIRST, and it exists because of how run 3 failed. ──
+          # Run 3's breadcrumbs read: BEGIN / WROTE_B64 2512 / DECODED 1882 / /usr/bin/bash, then
+          # SILENCE and exit 2. The script died before its own first echo, and the cause was mine:
+          # `ls -d <nonexistent>` exits 2, and with `set -e` plus `pipefail` that killed the script
+          # BEFORE the `if` written to report it. The guard I added to make failures loud is what
+          # made this one invisible. Two lessons, both encoded below:
+          #   - a command substitution whose failure you intend to HANDLE needs `|| true` inside it,
+          #     or pipefail hands it to set -e first;
+          #   - and I was guessing the checkout path. So now the box is asked rather than assumed,
+          #     and it reports unconditionally, before anything can fail.
+          echo "--- discovery ---"
+          echo "whoami: $(whoami 2>/dev/null || true)  home: ${HOME:-unset}"
+          echo "candidate dirs:"
+          for d in /home/* /root /opt /srv /var/www; do
+            [ -d "$d" ] && echo "  $d: $(ls -A "$d" 2>/dev/null | head -8 | tr '\n' ' ')"
+          done
+          echo "git checkouts found anywhere shallow:"
+          find / -maxdepth 4 -type d -name '.git' 2>/dev/null | head -10 | sed 's|/.git$||' | sed 's/^/  /' || true
+          echo "docker ps:"
+          docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null || echo "  (docker ps failed)"
+          echo "docker images:"
+          docker images --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}' 2>/dev/null | head -8 || true
+          echo "local /health right now:"
+          curl -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | sed 's/^/  /' || echo "  (no answer on 8080)"
+          echo "--- end discovery ---"
+
+          # `|| true` INSIDE the substitution: see the comment above. Without it pipefail hands
+          # ls's exit 2 to set -e and the script dies before reporting anything at all.
+          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence /opt/ottoq-intelligence /srv/ottoq-intelligence 2>/dev/null | head -1 || true)"
           if [ -z "${CHECKOUT:-}" ]; then
-            echo "FATAL: no ottoq-intelligence checkout found on this box"
+            CHECKOUT="$(find / -maxdepth 5 -type d -name 'ottoq-intelligence' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${CHECKOUT:-}" ]; then
+            echo "FATAL: no ottoq-intelligence checkout found on this box."
+            echo "The discovery block above says what IS here. Read that rather than re-running:"
+            echo "if the service was deployed from an image built elsewhere, there is no checkout to"
+            echo "pull and this workflow is the wrong shape for that box."
             exit 1
           fi
           echo "checkout: ${CHECKOUT}"
