@@ -184,20 +184,36 @@ jobs:
             exit 0
           fi
 
-          # `|| true` INSIDE the substitution: see the comment above. Without it pipefail hands
-          # ls's exit 2 to set -e and the script dies before reporting anything at all.
-          CHECKOUT="$(ls -d /home/*/ottoq-intelligence /root/ottoq-intelligence /opt/ottoq-intelligence /srv/ottoq-intelligence 2>/dev/null | head -1 || true)"
+          # ── FIND THE TREE BY WHAT IT CONTAINS, NOT BY WHAT IT IS CALLED. ──
+          # Run 6 shipped the source perfectly (DECODED_SRC 23085 bytes, byte-exact) and then still
+          # said "no checkout found", because this locator searched for a directory NAMED
+          # `ottoq-intelligence` and the one on the box is **/opt/ottoq**. The discovery block had
+          # printed that path, and I had written it into the commit message and the PR body, and
+          # still left the search looking for the other name. Identify a thing by what it IS.
+          #
+          # The signature is a Dockerfile beside app/main.py — the two files this deploy actually
+          # needs. A directory that has both is the tree we build, whatever it is called; one that
+          # lacks either is not, however promising its name.
+          CHECKOUT=""
+          for d in /opt/ottoq /opt/ottoq-intelligence /srv/ottoq /srv/ottoq-intelligence \
+                   /root/ottoq /root/ottoq-intelligence /home/*/ottoq /home/*/ottoq-intelligence; do
+            if [ -f "${d}/Dockerfile" ] && [ -f "${d}/app/main.py" ]; then CHECKOUT="${d}"; break; fi
+          done
           if [ -z "${CHECKOUT:-}" ]; then
-            CHECKOUT="$(find / -maxdepth 5 -type d -name 'ottoq-intelligence' 2>/dev/null | head -1 || true)"
+            # `|| true` INSIDE the substitution: without it pipefail hands find's exit status to
+            # set -e and the script dies before reporting anything, which is how run 3 failed.
+            CHECKOUT="$(find / -maxdepth 6 -path '*/app/main.py' 2>/dev/null | head -1 \
+                        | sed 's|/app/main.py$||' || true)"
+            [ -n "${CHECKOUT:-}" ] && [ ! -f "${CHECKOUT}/Dockerfile" ] && CHECKOUT=""
           fi
           if [ -z "${CHECKOUT:-}" ]; then
-            echo "FATAL: no ottoq-intelligence checkout found on this box."
+            echo "FATAL: no directory on this box holds both a Dockerfile and app/main.py."
             echo "The discovery block above says what IS here. Read that rather than re-running:"
-            echo "if the service was deployed from an image built elsewhere, there is no checkout to"
-            echo "pull and this workflow is the wrong shape for that box."
+            echo "if the service was deployed from an image built elsewhere, there is no tree to"
+            echo "update in place and this workflow is the wrong shape for that box."
             exit 1
           fi
-          echo "checkout: ${CHECKOUT}"
+          echo "checkout: ${CHECKOUT} (identified by Dockerfile + app/main.py)"
           cd "${CHECKOUT}"
 
           # ── THE SOURCE ARRIVES AS A TARBALL, because this box has no git. ──
