@@ -1,0 +1,142 @@
+# aws-release-eip — release one Elastic IP that is billing for nothing.
+#
+# WHY THIS IS ITS OWN WORKFLOW AND NOT A FLAG ON ANOTHER ONE.
+#
+# Releasing an Elastic IP is the least reversible thing in this repository. The address is returned
+# to AWS's pool and **cannot be recovered** — a re-allocation gives you a different address. So it
+# does not belong behind a flag on a workflow whose normal job is something else, where a stray
+# dispatch could reach it. One purpose, one file, and the address must be typed in as an input.
+#
+# WHAT IT IS FOR. `aws-recon` found exactly one Elastic IP in the account, `54.166.168.193`,
+# associated with `i-039b20c72b7a7d085` (`Ottoq-isaac`, a g5.2xlarge) which has been **stopped since
+# 2026-08-15**. An Elastic IP is free only while attached to a RUNNING instance; attached to a
+# stopped one it bills continuously. So that address has been charging for roughly five weeks for
+# nothing. The operator asked for it gone, in those words, on 2026-09-21.
+#
+# ══ THE GUARD THAT MATTERS ═════════════════════════════════════════════════
+#
+# Releasing an address attached to a RUNNING instance would cut that instance off the internet at
+# its published address — the one real way this could do damage. So the workflow refuses unless the
+# associated instance is verifiably NOT running. It reads the instance's state itself rather than
+# trusting the reason it was given.
+#
+# It also refuses if the address is not the one named, so a copy-paste of the wrong allocation id
+# cannot release a different address. And it does NOT touch the instance in any way: no stop, no
+# start, no termination, no security-group change. Only the address association and the allocation.
+#
+# An address already disassociated is released directly; the disassociate step is skipped rather
+# than failed, so a partial earlier run is recoverable by re-running.
+
+name: aws-release-eip
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_ip:
+        description: "The Elastic IP to release. Irreversible — the address cannot be recovered."
+        required: true
+      i_understand_this_is_irreversible:
+        description: "Type RELEASE to confirm"
+        required: true
+        default: ""
+
+concurrency:
+  group: aws-release-eip
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  TARGET_IP: ${{ inputs.public_ip }}
+  CONFIRM: ${{ inputs.i_understand_this_is_irreversible }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Guard — confirmed, and not attached to anything running
+        id: guard
+        run: |
+          set -euo pipefail
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+
+          if [ "${CONFIRM}" != "RELEASE" ]; then
+            echo "::error::REFUSING: the confirmation input must be exactly RELEASE."
+            echo "This releases an Elastic IP permanently. The address cannot be recovered."
+            exit 1
+          fi
+
+          read -r alloc assoc iid <<<"$(aws ec2 describe-addresses --public-ips "${TARGET_IP}" \
+            --query 'Addresses[0].[AllocationId,AssociationId,InstanceId]' --output text)"
+          echo "address ${TARGET_IP}: allocation=${alloc} association=${assoc} instance=${iid}"
+          if [ -z "${alloc}" ] || [ "${alloc}" = "None" ]; then
+            echo "::error::REFUSING: no allocation found for ${TARGET_IP} in this region."
+            exit 1
+          fi
+
+          # THE GUARD THAT MATTERS. Read the instance's state directly rather than trusting the
+          # reason this workflow was dispatched. Releasing an address off a RUNNING instance would
+          # cut it off the internet at its published address.
+          if [ -n "${iid}" ] && [ "${iid}" != "None" ]; then
+            state="$(aws ec2 describe-instances --instance-ids "${iid}" \
+                      --query 'Reservations[0].Instances[0].State.Name' --output text)"
+            name="$(aws ec2 describe-instances --instance-ids "${iid}" \
+                      --query 'Reservations[0].Instances[0].join(`,`,Tags[?Key==`Name`].Value)' --output text)"
+            echo "attached instance ${iid} (${name}) is ${state}"
+            if [ "${state}" = "running" ] || [ "${state}" = "pending" ]; then
+              echo "::error::REFUSING: ${iid} (${name}) is ${state}."
+              echo "Releasing this address would cut a live instance off the internet at the address"
+              echo "other things may be pointing at. Stop the instance deliberately first, or pick a"
+              echo "different address."
+              exit 1
+            fi
+          else
+            echo "address is not associated with any instance."
+          fi
+
+          echo "alloc=${alloc}"  >> "$GITHUB_OUTPUT"
+          echo "assoc=${assoc}"  >> "$GITHUB_OUTPUT"
+          echo "guards passed"
+
+      - name: Disassociate, if it is associated
+        run: |
+          set -euo pipefail
+          assoc="${{ steps.guard.outputs.assoc }}"
+          if [ -z "${assoc}" ] || [ "${assoc}" = "None" ]; then
+            echo "already disassociated; nothing to do."
+          else
+            aws ec2 disassociate-address --association-id "${assoc}"
+            echo "disassociated ${assoc}"
+          fi
+
+      - name: Release the allocation
+        run: |
+          set -euo pipefail
+          alloc="${{ steps.guard.outputs.alloc }}"
+          aws ec2 release-address --allocation-id "${alloc}"
+          echo "released ${alloc} (${TARGET_IP})"
+
+      - name: Prove it is gone, and report what Elastic IPs remain
+        run: |
+          set -uo pipefail
+          # A release that is not verified is a release you will re-read the bill to check.
+          if aws ec2 describe-addresses --public-ips "${TARGET_IP}" >/dev/null 2>&1; then
+            echo "::error::${TARGET_IP} still resolves as an address in this account."
+            exit 1
+          fi
+          echo "verified: ${TARGET_IP} no longer exists in this account."
+          echo
+          echo "Elastic IPs remaining in us-east-1:"
+          out="$(aws ec2 describe-addresses \
+                  --query 'Addresses[].[PublicIp,InstanceId,Domain]' --output text 2>/dev/null || true)"
+          if [ -z "${out}" ] || [ "${out}" = "None" ]; then
+            echo "  none. No Elastic IP is billing in this region."
+          else
+            printf '%s\n' "${out}" | sed 's/^/  /'
+          fi
