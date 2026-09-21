@@ -2,8 +2,44 @@ fastapi>=0.111
 uvicorn[standard]>=0.30
 pydantic>=2.7
 pulp>=2.8          # LP/MILP modeling; ships CBC, prefers HiGHS if present
-highspy>=1.7       # HiGHS solver (fast, modern, OSS)
 numpy>=1.26
 ortools==9.15.6755  # must match otto-q-core's reproducibility pin
+#
+# ══ highspy IS DELIBERATELY ABSENT, AND IT IS NOT AN OVERSIGHT ══════════════
+#
+# `highspy` and `ortools` CANNOT COEXIST IN ONE PYTHON PROCESS. Both ship their own
+# libhighs, with different ABIs, and whichever loads first wins the symbol namespace.
+# Measured both directions on python:3.11-slim with ortools 9.15.6755 + highspy 1.15.1:
+#
+#   import highspy ; from ortools.sat.python import cp_model
+#     -> ImportError: ortools/.libs/libortools.so.9: undefined symbol:
+#        _Z19setLocalOptionValueRK15HighsLogOptions...  (a HiGHS symbol)
+#   from ortools.sat.python import cp_model ; import highspy
+#     -> ImportError: highspy/_core...so: undefined symbol: _ZN5Highs13releaseMemoryEv
+#
+# THIS IS WHAT TOOK CP-SAT DOWN, and it presented as something else entirely. app/main.py
+# imports energy_mpc (pulp -> highspy) on line 25 and assignment_cpsat (ortools) on line 26,
+# so highspy always won the race and ortools always lost. assignment_cpsat catches ImportError
+# and re-raises "otto-q-core is unavailable; set OTTOQ_CORE_ROOT to its pinned checkout" --
+# which was FALSE: the checkout was present and complete at the pinned ref, and the real cause
+# was four frames further down, in a shared object. The service booted, answered /health with
+# optimizers:["energy_mpc"], returned 2xx, and the agent chain read that as a stale image for a
+# day. A wrapped exception that names a cause it did not verify is worse than no message.
+#
+# WHY highspy LOSES THE TIE. ortools is pinned to otto-q-core's reproducibility pin (CLAUDE.md
+# 2.5: pin the OR-Tools version, 9.4 and 9.5 both shipped nondeterministic results), and it is
+# the ONLY solver that can express the site layer -- cumulative resource, disjunctive machine,
+# sequence-dependent gap. It is not substitutable. highspy is a speed optimization for one LP.
+#
+# AND THE COST IS SPEED ONLY, MEASURED RATHER THAN ASSUMED. energy_mpc's model is continuous
+# throughout (dis/chg/soc/grid/peak/viol are all plain LpVariable), so simplex is exact and the
+# optimum does not depend on which simplex. Same 48-step case, identical inputs:
+#     CBC    objective 11934.975575   predicted_peak_kw 458.081060   Optimal
+#     HiGHS  objective 11934.975621   predicted_peak_kw 458.081062   Optimal
+# 3.9e-9 relative on the objective. _pick_solver() already degrades HiGHS -> HiGHS_CMD -> CBC
+# behind try/except + .available(), so removing the wheel needs no code change.
+#
+# IF HiGHS IS EVER WANTED BACK, take `HiGHS_CMD` -- the standalone `highs` binary, a separate
+# process, no shared library, no ABI to collide. Never the wheel, in this image.
 # FR-2 (GPU tier): neuralforecast, torch  — installed in the GPU image only
 # FR-3 specialization: cuOpt client / requests  |  FR-4: openai-compatible NIM client

@@ -17,11 +17,32 @@ CORE_ROOT = Path(os.environ.get("OTTOQ_CORE_ROOT", "/opt/otto-q-core"))
 if CORE_ROOT.exists() and str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
 
+# DO NOT NAME A CAUSE THIS HANDLER HAS NOT CHECKED.
+#
+# This used to raise, unconditionally, "otto-q-core is unavailable; set OTTOQ_CORE_ROOT to its
+# pinned checkout". On 2026-09-21 that sentence was false and cost a day: the checkout was
+# present and complete at the pinned ref, and the actual failure was an ABI collision between
+# highspy's libhighs and ortools' four frames further down (see requirements.txt). The service
+# then served /health with optimizers:["energy_mpc"], and the edge function's only clue was a
+# 2xx it had to infer staleness from.
+#
+# So the handler now DISTINGUISHES the two, by looking, and carries the original message either
+# way. An ImportError from deep inside a shared object is not a missing checkout, and a message
+# that conflates them sends the next reader to the wrong file.
 try:
     from bridge.proposer_bridge import fire
 except ImportError as exc:  # pragma: no cover, exercised by deployment health
+    _missing = not (CORE_ROOT / "bridge" / "proposer_bridge.py").is_file()
     raise RuntimeError(
-        "otto-q-core is unavailable; set OTTOQ_CORE_ROOT to its pinned checkout"
+        (
+            f"otto-q-core is unavailable at OTTOQ_CORE_ROOT={CORE_ROOT}: "
+            f"bridge/proposer_bridge.py is not there. Underlying: {exc!r}"
+        )
+        if _missing
+        else (
+            f"otto-q-core IS present at OTTOQ_CORE_ROOT={CORE_ROOT}, so this is NOT a missing "
+            f"checkout -- the import chain itself failed. Underlying: {exc!r}"
+        )
     ) from exc
 
 
