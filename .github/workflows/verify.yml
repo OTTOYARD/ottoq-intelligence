@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: OTTOYARD/otto-q-core
-          ref: 480427d2e670c0449796ec823535719494d8b364
+          ref: 63a4c74b3f17daab08a0b9a55e76187dc8b27b78
           path: otto-q-core
       - uses: actions/setup-python@v5
         with:

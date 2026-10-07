@@ -90,3 +90,49 @@ def test_rejection_feedback_forces_one_bounded_resolve():
     assert result["pipeline"]["feedback_applied"] is True
     assert result["rows"][0]["proposal"]["stall_id"] != rejected_stall
     assert result["fire"]["retry_attempts"][0]["repeated_rejected_stalls"] == [rejected_stall]
+
+
+V2 = "6e7d0b1c-0000-4000-8000-000000000002"
+
+
+def _two_car_frame():
+    frame = _frame()
+    second = dict(frame["vehicles"][0], id=V2, soc=60)
+    frame["vehicles"] = [frame["vehicles"][0], second]
+    return frame
+
+
+def test_the_kernel_queue_order_chooses_the_batch():
+    """0613: with one car to plan, the service plans the one the kernel will seat next -- here the
+    higher-SoC car, which the solver's own urgency order would have put second."""
+    result = optimize_assignment(
+        frame=_two_car_frame(), class_rows=CLASS_ROWS, site=SITE,
+        sim_run_id=RUN, depot_id=DEPOT, objective="readiness_first",
+        max_assets=1, det_budget_s=0.05, priority=[V2, V1],
+    )
+    planned = [row["entity_id"] for row in result["rows"] if not row["proposal"]["abstain"]]
+    assert planned == [V2]
+    assert result["fire"]["batch_order"] == "kernel_queue"
+    assert result["pipeline"]["batch_order"] == "kernel_queue"
+    assert result["pipeline"]["priority_dropped"] is False
+
+
+def test_without_a_queue_the_batch_is_the_solvers_urgency_order():
+    result = optimize_assignment(
+        frame=_two_car_frame(), class_rows=CLASS_ROWS, site=SITE,
+        sim_run_id=RUN, depot_id=DEPOT, objective="readiness_first",
+        max_assets=1, det_budget_s=0.05,
+    )
+    planned = [row["entity_id"] for row in result["rows"] if not row["proposal"]["abstain"]]
+    assert planned == [V1]
+    assert result["pipeline"]["batch_order"] == "urgency"
+
+
+def test_an_oversized_queue_is_refused():
+    import pytest
+    with pytest.raises(ValueError, match="priority"):
+        optimize_assignment(
+            frame=_two_car_frame(), class_rows=CLASS_ROWS, site=SITE,
+            sim_run_id=RUN, depot_id=DEPOT, objective="readiness_first",
+            max_assets=1, det_budget_s=0.05, priority=[V1] * 65,
+        )
