@@ -333,7 +333,12 @@ jobs:
               echo "FATAL: cannot read OTTOQ_API_TOKEN from the container; refusing to rebuild tokenless."
               exit 1
             fi
-            docker build -t ottoq-intel:rollback .
+            if ! docker build -t ottoq-intel:rollback . > /tmp/ottoq_build.log 2>&1; then
+              echo "docker build log, last 60 lines:"
+              tail -n 60 /tmp/ottoq_build.log | sed 's/^/  build: /'
+              echo "FATAL: the rollback image did not build. The serving container was NOT touched."
+              exit 1
+            fi
             docker rm -f ottoq-intel 2>/dev/null || true
             docker tag ottoq-intel:rollback ottoq-intel:latest
             docker run -d --restart unless-stopped -p 8080:8080 \
@@ -412,12 +417,22 @@ jobs:
 
           # Temporary tag, so a build failure leaves the CURRENT container running and serving. And put
           # the tree and the recorded sha back too: the box must not claim a commit it is not serving.
-          if ! docker build -t ottoq-intel:new .; then
+          #
+          # THE BUILD LOG GOES TO A FILE, NOT TO STDOUT. SSM returns only the first 24,000 characters
+          # of a command's stdout (GetCommandInvocation, StandardOutputContent:
+          # https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_GetCommandInvocation.html).
+          # On 2026-10-07 (run 17, the first automatic deploy) apt and git progress lines from this build
+          # filled all of it, the box's closing VERIFIED lines were cut off, and a deploy that reached
+          # the end of this script was reported as "none of the outcomes this workflow checks for".
+          if ! docker build -t ottoq-intel:new . > /tmp/ottoq_build.log 2>&1; then
+            echo "docker build log, last 60 of $(wc -l < /tmp/ottoq_build.log) lines:"
+            tail -n 60 /tmp/ottoq_build.log | sed 's/^/  build: /'
             cp -a "${BACKUP}/app" "${BACKUP}/Dockerfile" "${BACKUP}/requirements.txt" "${CHECKOUT}/" 2>/dev/null || true
             printf '%s\n' "${PREV_SHA}" > "${CHECKOUT}/.deployed_sha"
             echo "FATAL: docker build failed. The serving container was NOT touched; tree and records restored."
             exit 1
           fi
+          echo "image built ($(wc -l < /tmp/ottoq_build.log) log lines in /tmp/ottoq_build.log on the box)"
 
           # Put the image that was serving before back, and the tree and records with it, so the box
           # still describes what it serves. Then exit non-zero: the deploy FAILED, even though the
@@ -598,6 +613,8 @@ jobs:
           out="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
                    --query StandardOutputContent --output text 2>/dev/null || true)"
           outcome=other
+          # SSM keeps only the first 24,000 characters of stdout. A cut output cannot name its path.
+          if [ "${#out}" -ge 23900 ]; then outcome=truncated; fi
           case "${out}" in *"UNCHANGED:"*) outcome=unchanged ;; esac
           case "${out}" in *"ROLLED BACK to the previous image"*) outcome=rolled_back ;; esac
           case "${out}" in *"VERIFIED: /assign answers"*) outcome=deployed ;; esac
@@ -667,6 +684,9 @@ jobs:
             echo "post-rollback /health line above for what the service is actually serving."
           elif [ "${{ steps.send.outputs.outcome }}" = "deployed" ]; then
             echo "rebuild succeeded: /health lists ${EXPECT}, and a real /assign came back from it with the kernel's order applied"
+          elif [ "${{ steps.send.outputs.outcome }}" = "truncated" ]; then
+            echo "::error::the box finished with success, but its output was longer than the 24,000 characters SSM returns, so this run cannot see which checks it passed. Run this workflow with discover_only=true to look."
+            exit 1
           else
             echo "::error::the box reported success but none of the outcomes this workflow checks for. Read its output above."
             exit 1
