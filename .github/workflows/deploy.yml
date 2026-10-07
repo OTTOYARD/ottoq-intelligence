@@ -22,25 +22,22 @@
 #   EC2_SSH_KEY   the full private key text that matches the instance's key pair
 # Optionally EC2_PORT (defaults to 22).
 #
-# After that this runs on demand from the Actions tab, or automatically on a push to main
-# that touches the service.
+# After that this runs on demand from the Actions tab. (It used to run on every push to main as well;
+# aws-deploy-ssm.yml does that now. See the note on `on:` below.)
 
 name: deploy
 
 on:
+  # NO LONGER AUTOMATIC (2026-10-07). It needs EC2_HOST / EC2_USER / EC2_SSH_KEY, which were never
+  # configured, so every merge to main produced a red run that changed nothing on the box (runs 1-3).
+  # aws-deploy-ssm.yml now deploys every push to main after `verify` passes, over SSM, with no key.
+  # This stays as a manual fallback for a box that is not SSM-managed.
   workflow_dispatch:
     inputs:
       expect_optimizer:
         description: "Optimizer name that /health must list after deploy"
         required: false
         default: "cp_sat_forward_lex"
-  push:
-    branches: [main]
-    paths:
-      - "app/**"
-      - "Dockerfile"
-      - "requirements.txt"
-      - ".github/workflows/deploy.yml"
 
 concurrency:
   # Two concurrent deploys would race on the container name. Never cancel in progress:
