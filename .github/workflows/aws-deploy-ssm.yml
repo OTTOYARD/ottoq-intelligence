@@ -25,6 +25,18 @@
 # requirements.txt, so the running image physically could not serve CP-SAT. Nothing was broken
 # except that the image predated the feature.
 #
+# AUTOMATIC SINCE 2026-10-07. Until then this ran only when someone pressed the button, and
+# deploy.yml was the automatic path -- which needs three SSH secrets that were never configured,
+# so every merge to main produced a red deploy and changed nothing on the box (runs 1-3 of
+# deploy.yml, the last one when ottoq-intelligence#15 merged). Now:
+#   - every push to main deploys itself, but only AFTER `verify` passes on that exact commit
+#     (workflow_run), and it deploys that commit (head_sha), never whatever main has moved to;
+#   - the box is found by its Name tag, so nobody has to know an instance id;
+#   - an automatic deploy of source the box already serves rebuilds nothing (digest match);
+#   - after the swap, a real /assign request must come back from the new build, not only /health;
+#   - and if the new build fails either check, the previous image is put back automatically,
+#     so a bad deploy costs seconds of service, not an outage until someone notices.
+#
 # PREREQUISITE: the instance must be SSM-managed. `aws-activate-ssm.yml` does that, and
 # confirmed it on 2026-09-21 — i-01500ed2fddc67c66 reported Online in 20s, Ubuntu 24.04, agent
 # 3.3.4793.0. If SSM cannot reach the box this workflow fails immediately and says so, rather
@@ -33,11 +45,18 @@
 name: aws-deploy-ssm
 
 on:
+  # Automatic: after `verify` passes on a push to main. Its own `if:` below refuses anything else
+  # (a failed verify, a pull request's verify, another branch).
+  workflow_run:
+    workflows: ["verify"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       instance_id:
-        description: "EC2 instance id (must be Name=ottoq-intel-2)"
-        required: true
+        description: "EC2 instance id (must be Name=ottoq-intel-2). Blank: the one running instance with that name"
+        required: false
+        default: ""
       expect_optimizer:
         description: "Optimizer name that /health must list after the deploy"
         required: false
@@ -72,15 +91,23 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: us-east-1
-  IID: ${{ inputs.instance_id }}
-  EXPECT: ${{ inputs.expect_optimizer }}
-  GITREF: ${{ inputs.git_ref }}
+  # The instance id is resolved by the guard step (by Name tag when not given) and exported as IID.
+  IID_INPUT: ${{ inputs.instance_id }}
+  EXPECT: ${{ inputs.expect_optimizer || 'cp_sat_forward_lex' }}
+  # An automatic deploy ships the commit `verify` passed on, not whatever main points at by now.
+  GITREF: ${{ inputs.git_ref || github.event.workflow_run.head_sha || 'main' }}
   EXPECT_NAME: ottoq-intel-2
-  DISCOVER_ONLY: ${{ inputs.discover_only }}
-  ROLLBACK: ${{ inputs.rollback }}
+  DISCOVER_ONLY: ${{ inputs.discover_only || 'false' }}
+  ROLLBACK: ${{ inputs.rollback || 'false' }}
+  AUTO: ${{ github.event_name == 'workflow_run' }}
 
 jobs:
   deploy:
+    # A button press always runs. An automatic run needs a GREEN verify of a PUSH (not a pull
+    # request's verify, which also completes as a workflow_run on its own head branch).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 70
     steps:
@@ -90,7 +117,7 @@ jobs:
         # never have worked: /opt/ottoq holds the full tree but no .git anywhere on the host.
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: ${{ env.GITREF }}
           fetch-depth: 1
 
       - name: Guard — the target must be the intelligence box, and SSM must already reach it
@@ -98,6 +125,22 @@ jobs:
           set -euo pipefail
           acct="$(aws sts get-caller-identity --query Account --output text)"
           echo "::add-mask::${acct}"
+
+          # No id given (every automatic deploy): the ONE running instance named ottoq-intel-2.
+          # Zero or several is a refusal, never a guess.
+          IID="${IID_INPUT:-}"
+          if [ -z "${IID}" ]; then
+            IID="$(aws ec2 describe-instances \
+                     --filters "Name=tag:Name,Values=${EXPECT_NAME}" "Name=instance-state-name,Values=running" \
+                     --query 'Reservations[].Instances[].InstanceId' --output text)"
+            n="$(wc -w <<<"${IID}")"
+            if [ "${n}" -ne 1 ]; then
+              echo "::error::REFUSING: expected exactly one running instance named ${EXPECT_NAME}, found ${n} (${IID:-none})."
+              exit 1
+            fi
+            echo "resolved ${EXPECT_NAME} -> ${IID}"
+          fi
+          echo "IID=${IID}" >> "$GITHUB_ENV"
 
           # Same name guard as aws-activate-ssm. A deploy is less dangerous than a start, but
           # running a docker build on the wrong box is still not something to do by typo.
@@ -319,6 +362,18 @@ jobs:
           fi
           echo "tarball digest verified: ${got}"
 
+          # ── AN AUTOMATIC DEPLOY OF SOURCE THE BOX ALREADY SERVES REBUILDS NOTHING. ──
+          # Every push to main deploys now, docs included, and a rebuild restarts the container.
+          # The digest covers app/, Dockerfile and requirements.txt (so a moved core pin counts as a
+          # change), and it only counts as served while /health still lists the expected optimizer.
+          # A button press always rebuilds: whoever pressed it wants it to run.
+          if [ "__AUTO__" = "true" ] \
+             && [ "$(cat "${CHECKOUT}/.deployed_src_sha256" 2>/dev/null || true)" = "__SRC_SHA__" ] \
+             && curl -fsS --max-time 10 http://127.0.0.1:8080/health 2>/dev/null | grep -q -- '__EXPECT__'; then
+            echo "UNCHANGED: the box already serves source __SRC_SHA_SHORT__ and /health lists __EXPECT__. Nothing rebuilt."
+            exit 0
+          fi
+
           # A backup, because the temporary image tag protects the RUNNING container but not the
           # ability to rebuild the previous one. Timestamped so repeated deploys do not overwrite
           # the only copy of a known-good tree.
@@ -326,6 +381,15 @@ jobs:
           mkdir -p "${BACKUP}"
           cp -a app Dockerfile requirements.txt "${BACKUP}/" 2>/dev/null || true
           echo "previous tree backed up to ${BACKUP}"
+          PREV_SHA="$(cat "${CHECKOUT}/.deployed_sha" 2>/dev/null || true)"
+          PREV_SRC="$(cat "${CHECKOUT}/.deployed_src_sha256" 2>/dev/null || true)"
+          # The IMAGE that is serving now, kept under a tag, so a new build that will not serve can be
+          # swapped back in seconds instead of rebuilt from the backup tree in minutes.
+          PREV_IMAGE="$(docker inspect ottoq-intel --format '{{.Image}}' 2>/dev/null || true)"
+          if [ -n "${PREV_IMAGE:-}" ]; then
+            docker tag "${PREV_IMAGE}" ottoq-intel:previous
+            echo "serving image kept as ottoq-intel:previous (${PREV_IMAGE:7:12})"
+          fi
 
           tar xzf /tmp/ottoq_src.tgz -C "${CHECKOUT}"
           echo "extracted __GITREF__ (__SRC_SHA_SHORT__) into ${CHECKOUT}"
@@ -346,8 +410,41 @@ jobs:
             exit 1
           fi
 
-          # Temporary tag, so a build failure leaves the CURRENT container running and serving.
-          docker build -t ottoq-intel:new .
+          # Temporary tag, so a build failure leaves the CURRENT container running and serving. And put
+          # the tree and the recorded sha back too: the box must not claim a commit it is not serving.
+          if ! docker build -t ottoq-intel:new .; then
+            cp -a "${BACKUP}/app" "${BACKUP}/Dockerfile" "${BACKUP}/requirements.txt" "${CHECKOUT}/" 2>/dev/null || true
+            printf '%s\n' "${PREV_SHA}" > "${CHECKOUT}/.deployed_sha"
+            echo "FATAL: docker build failed. The serving container was NOT touched; tree and records restored."
+            exit 1
+          fi
+
+          # Put the image that was serving before back, and the tree and records with it, so the box
+          # still describes what it serves. Then exit non-zero: the deploy FAILED, even though the
+          # service is up again, and the workflow must say so.
+          restore_previous() {
+            echo "ROLLING BACK: $1"
+            echo "new container's last log lines:"
+            docker logs ottoq-intel --tail 30 2>&1 | sed 's/^/  /' || true
+            docker rm -f ottoq-intel 2>/dev/null || true
+            if ! docker image inspect ottoq-intel:previous >/dev/null 2>&1; then
+              echo "FATAL: no previous image to put back. The service is DOWN; dispatch with rollback=true."
+              exit 1
+            fi
+            docker tag ottoq-intel:previous ottoq-intel:latest
+            docker run -d --restart unless-stopped -p 8080:8080 \
+              -e OTTOQ_API_TOKEN="${TOKEN}" --name ottoq-intel ottoq-intel:latest
+            cp -a "${BACKUP}/app" "${BACKUP}/Dockerfile" "${BACKUP}/requirements.txt" "${CHECKOUT}/" 2>/dev/null || true
+            printf '%s\n' "${PREV_SHA}" > "${CHECKOUT}/.deployed_sha"
+            if [ -n "${PREV_SRC:-}" ]; then printf '%s\n' "${PREV_SRC}" > "${CHECKOUT}/.deployed_src_sha256"; else rm -f "${CHECKOUT}/.deployed_src_sha256"; fi
+            printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) ROLLED_BACK __GITSHA__ -> ${PREV_SHA:-unknown}" >> "${CHECKOUT}/.deploy_history"
+            for i in $(seq 1 45); do
+              curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+              sleep 2
+            done
+            echo "ROLLED BACK to the previous image (${PREV_SHA:-unknown sha}). /health now: $(curl -fsS --max-time 10 http://127.0.0.1:8080/health 2>/dev/null || echo NO_ANSWER)"
+            exit 1
+          }
 
           docker rm -f ottoq-intel 2>/dev/null || true
           docker tag ottoq-intel:new ottoq-intel:latest
@@ -360,17 +457,61 @@ jobs:
             sleep 2
           done
 
-          BODY="$(curl -fsS --max-time 10 http://127.0.0.1:8080/health)"
-          echo "HEALTH: ${BODY}"
+          # `|| true` inside: a container that never answers must reach the rollback below, not end the
+          # script here under set -e with the service down (the shape of run 7).
+          BODY="$(curl -fsS --max-time 10 http://127.0.0.1:8080/health 2>/dev/null || true)"
+          echo "HEALTH: ${BODY:-NO_ANSWER}"
           if ! printf '%s' "${BODY}" | grep -q -- '__EXPECT__'; then
-            echo "FATAL: /health does not list __EXPECT__. The running image is not the build just deployed."
-            exit 1
+            restore_previous "/health does not list __EXPECT__ (the new build is not serving it)"
           fi
           echo "VERIFIED: /health lists __EXPECT__"
+
+          # ── A REAL REQUEST, not only /health. ──
+          # /health is a hard-coded list; it cannot see an import that fails on first use, a core pin
+          # the bridge cannot drive, or a request shape the service now refuses. One small /assign
+          # (one car, one fast charger, the kernel's order given) must come back 200 from CP-SAT, with
+          # the order applied. Pure compute: /assign returns rows and writes nothing anywhere.
+          cat > /tmp/ottoq_smoke.json <<'JSON'
+          {"sim_run_id":"00000000-0000-4000-8000-000000005e70","depot_id":"11111111-1111-1111-1111-111111111111",
+           "frame":{"vehicles":[{"id":"6e7d0b1c-0000-4000-8000-000000000001","state":"arrived_at_gate","soc":25,
+             "stall_id":null,"inlet_type":"CCS1","inlet_max_kw":100,"target_soc":90,"min_soc_threshold":20,
+             "vehicle_class_code":"waymo_jaguar_ipace_2024"}],
+             "stalls":[{"id":"5a11a000-0000-4000-8000-000000000001","type":"dcfc","status":"available","vehicle_id":null,
+               "connector_type":"Multi","connector_max_kw":150,"supported_inlet_types":["CCS1"]}],
+             "sessions":[],"energy":null,"bess":null},
+           "class_rows":[{"vehicle_class_code":"waymo_jaguar_ipace_2024","battery_capacity_kwh":"90","max_charge_rate_kw":"100",
+             "charge_kinds":["dcfc","l2"],"energy_curve":[{"above_soc_pct":0,"accept_frac":1.0}],"battery_chemistry":"NMC"}],
+           "site":{"power_cap_kw_hard":2500,"power_soft_target_kw":1620,"dcfc_cooldown_min":18,"move_duration_min":4,
+             "path_capacity":2,"cold_start_below_c":5,"cold_start_penalty_min":12,"onpeak_window_min":[0,0]},
+           "directive":{"objective":"readiness_first","why":"deploy smoke test"},
+           "max_assets":1,"priority":["6e7d0b1c-0000-4000-8000-000000000001"],"det_budget_s":0.05,"max_retries":0,"hour_of_day":12}
+          JSON
+          CODE="$(curl -sS -o /tmp/ottoq_smoke_out.json -w '%{http_code}' --max-time 60 \
+                   -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+                   --data-binary @/tmp/ottoq_smoke.json http://127.0.0.1:8080/assign 2>/dev/null || echo 000)"
+          SMOKE="$(docker exec -i ottoq-intel python3 -c '
+          import json, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception as e:
+              print("unreadable response: %s" % e); sys.exit(0)
+          p = d.get("pipeline") or {}
+          print("primary=%s batch_order=%s priority_dropped=%s rows=%s status=%s" % (
+              p.get("primary"), p.get("batch_order"), p.get("priority_dropped"),
+              len(d.get("rows") or []), (d.get("fire") or {}).get("status")))
+          ' < /tmp/ottoq_smoke_out.json 2>&1 || true)"
+          echo "SMOKE /assign: http=${CODE} ${SMOKE}"
+          case "${CODE} ${SMOKE}" in
+            "200 primary=cp_sat_forward_lex batch_order=kernel_queue priority_dropped=False "*) ;;
+            *) restore_previous "a real /assign did not come back from CP-SAT with the kernel's order applied" ;;
+          esac
+          echo "VERIFIED: /assign answers from cp_sat_forward_lex with the kernel's order applied"
+
+          printf '%s\n' "__SRC_SHA__" > "${CHECKOUT}/.deployed_src_sha256"
           docker image prune -f >/dev/null 2>&1 || true
           SH
-          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g; s|__ROLLBACK__|${ROLLBACK}|g; s|__SRC_SHA__|${SRC_SHA}|g; s|__SRC_SHA_SHORT__|${SRC_SHA:0:12}|g; s|__GITSHA__|${GITSHA}|g" /tmp/ottoq_deploy.sh
-          for ph in __GITREF__ __EXPECT__ __DISCOVER_ONLY__ __SRC_SHA__ __GITSHA__ __ROLLBACK__; do
+          sed -i "s|__GITREF__|${GITREF}|g; s|__EXPECT__|${EXPECT}|g; s|__DISCOVER_ONLY__|${DISCOVER_ONLY}|g; s|__ROLLBACK__|${ROLLBACK}|g; s|__SRC_SHA__|${SRC_SHA}|g; s|__SRC_SHA_SHORT__|${SRC_SHA:0:12}|g; s|__GITSHA__|${GITSHA}|g; s|__AUTO__|${AUTO}|g" /tmp/ottoq_deploy.sh
+          for ph in __GITREF__ __EXPECT__ __DISCOVER_ONLY__ __SRC_SHA__ __GITSHA__ __ROLLBACK__ __AUTO__; do
             if grep -q -- "${ph}" /tmp/ottoq_deploy.sh; then
               echo "::error::placeholder ${ph} was not substituted; refusing to send."
               exit 1
@@ -452,6 +593,15 @@ jobs:
             esac
           done
           echo "final_status=${st}" >> "$GITHUB_OUTPUT"
+          # Which path the box took, from its own stdout, so the last step reports what happened
+          # rather than what the inputs implied.
+          out="$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${IID}" \
+                   --query StandardOutputContent --output text 2>/dev/null || true)"
+          outcome=other
+          case "${out}" in *"UNCHANGED:"*) outcome=unchanged ;; esac
+          case "${out}" in *"ROLLED BACK to the previous image"*) outcome=rolled_back ;; esac
+          case "${out}" in *"VERIFIED: /assign answers"*) outcome=deployed ;; esac
+          echo "outcome=${outcome}" >> "$GITHUB_OUTPUT"
 
       - name: Print what the box said, whatever happened
         if: always()
@@ -473,6 +623,14 @@ jobs:
           cid="${{ steps.send.outputs.cid }}"
           case "${st}" in
             Success) : ;;
+            Failed)
+              if [ "${{ steps.send.outputs.outcome }}" = "rolled_back" ]; then
+                echo "::error::the new build failed its checks and was ROLLED BACK. The previous build is serving again; the box's own output above says which check failed."
+                exit 1
+              fi
+              echo "::error::the rebuild did not succeed on the box (status: ${st})."
+              echo "The stdout/stderr above is from the box itself -- read that, not this line."
+              exit 1 ;;
             InProgress|Pending|Delayed)
               # Run 7 is why this branch exists. The command had not finished when the poll budget
               # ran out; calling that a failure would blame the box for my impatience, and would
@@ -501,10 +659,15 @@ jobs:
           # exhaustive case is the fix; a third patch to the same `else` would not be.
           if [ "${DISCOVER_ONLY}" = "true" ]; then
             echo "discovery completed. NOTHING was deployed and NO health assertion was made."
+          elif [ "${{ steps.send.outputs.outcome }}" = "unchanged" ]; then
+            echo "UNCHANGED: the box already serves this source, and /health lists ${EXPECT}. Nothing was rebuilt."
           elif [ "${ROLLBACK}" = "true" ]; then
             echo "ROLLBACK completed. The PREVIOUS tree is restored and rebuilt -- it does NOT"
             echo "contain ${EXPECT}, and no assertion about ${EXPECT} was made. Read the"
             echo "post-rollback /health line above for what the service is actually serving."
+          elif [ "${{ steps.send.outputs.outcome }}" = "deployed" ]; then
+            echo "rebuild succeeded: /health lists ${EXPECT}, and a real /assign came back from it with the kernel's order applied"
           else
-            echo "rebuild succeeded and /health lists ${EXPECT}"
+            echo "::error::the box reported success but none of the outcomes this workflow checks for. Read its output above."
+            exit 1
           fi
