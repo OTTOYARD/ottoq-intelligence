@@ -19,7 +19,7 @@ throttling a charger).
 |---|---|---|---|
 | **Optimize — Energy** | `POST /optimize/energy` | rolling-horizon **MILP/MPC** (HiGHS) — BESS+charge schedule minimizing demand-charge ratchet + TOU + wear | **LIVE + tested** |
 | **Forecast** | `POST /forecast` | statistical arrivals/load/SoC from the real-world calibration priors (ACN-Data, NYC TLC, EIA, NREL) — `forecasters/priors.py` + `forecasters/statistical.py`, never fitted on sim output | **LIVE** (the TFT/NHITS GPU forecaster is a later upgrade behind the same interface) |
-| **Optimize — Assign** | `POST /assign` | **CP-SAT**, not cuOpt — `optimizers/assignment_cpsat.py` calls `bridge.proposer_bridge.fire` from the pinned otto-q-core checkout (`OTTOQ_CORE_REF`). The kernel still disposes. | **LIVE** (dark in-engine only while `OTTOQ_INTEL_URL`/`OTTOQ_INTEL_TOKEN` are unset) |
+| **Optimize — Assign** | `POST /assign` | **CP-SAT**, not cuOpt — `optimizers/assignment_cpsat.py` calls `bridge.proposer_bridge.fire` from the pinned otto-q-core checkout (`OTTOQ_CORE_REF`). The kernel still disposes. Since otto-q-core 0613 the caller sends `max_assets` = the free chargers and `priority` = the kernel's charge queue in seating order, so the solver plans the cars the next free chargers go to; `pipeline.batch_order` says which order chose the batch. | **LIVE** (dark in-engine only while `OTTOQ_INTEL_URL`/`OTTOQ_INTEL_TOKEN` are unset) |
 | **Orchestrate** | `POST /orchestrate` | **Nemotron** conductor (NIM) over the specialist optimizers | stub → FR-4 |
 | **Learn** | (offline) | CIL — offline RL / Bayesian tuning from run outcomes | FR-5 |
 

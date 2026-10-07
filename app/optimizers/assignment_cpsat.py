@@ -7,6 +7,7 @@ FastAPI boundary used by the energy optimizer. It never writes depot state.
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,10 @@ except ImportError as exc:  # pragma: no cover, exercised by deployment health
         )
     ) from exc
 
+
+#: 0613: whether the pinned core's bridge can take the kernel's queue order. A pin that predates it
+#: gets the request without the order, and the result says so rather than pretending it was used.
+FIRE_TAKES_PRIORITY = "priority" in inspect.signature(fire).parameters
 
 OBJECTIVE_SIGNALS: dict[str, frozenset[str]] = {
     "readiness_first": frozenset(),
@@ -101,6 +106,7 @@ def optimize_assignment(
     det_budget_s: float = 0.25,
     max_retries: int = 2,
     hour_of_day: int = 12,
+    priority: list[str] | None = None,
 ) -> dict[str, Any]:
     if objective not in OBJECTIVE_SIGNALS:
         raise ValueError(f"unknown objective {objective!r}")
@@ -113,8 +119,12 @@ def optimize_assignment(
     if not 0 <= hour_of_day <= 23:
         raise ValueError("hour_of_day must be between 0 and 23")
 
+    if priority is not None and len(priority) > 64:
+        raise ValueError("priority must name at most 64 vehicles")
     feedback = feedback or []
     blocked = _blocked_pairs(feedback)
+    #: 0613: the kernel's order reaches the bridge only when the pinned core can take it.
+    order_kwargs = {"priority": list(priority)} if (priority is not None and FIRE_TAKES_PRIORITY) else {}
     working = copy.deepcopy(frame)
     attempts: list[dict[str, Any]] = []
 
@@ -130,6 +140,7 @@ def optimize_assignment(
             max_assets=max_assets,
             det_budget_s=det_budget_s,
             allow_rejection=True,
+            **order_kwargs,
         )
         repeated = _conflicts(result["rows"], blocked)
         attempts.append({
@@ -147,6 +158,10 @@ def optimize_assignment(
                 "objective": objective,
                 "attempts": len(attempts),
                 "feedback_applied": bool(blocked),
+                #: 0613: which order chose the batch, as the bridge recorded it, and whether a
+                #: requested order was dropped because the pinned core predates it.
+                "batch_order": result["fire"].get("batch_order", "urgency"),
+                "priority_dropped": priority is not None and not FIRE_TAKES_PRIORITY,
             }
             return result
         working = _remove_stalls(working, repeated)

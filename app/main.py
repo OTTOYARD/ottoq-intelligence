@@ -168,6 +168,9 @@ class AssignmentIn(BaseModel):
     directive: SolverDirectiveIn
     feedback: List[AssignmentFeedbackIn] = Field(default_factory=list)
     max_assets: int = Field(8, ge=1, le=24)
+    # 0613 (otto-q-core): the kernel's charge queue in the order it seats cars, from
+    # public.ottoq_run_learning. Given, the batch is its head; absent, the solver's own urgency order.
+    priority: Optional[List[str]] = Field(None, max_length=64)
     det_budget_s: float = Field(0.25, ge=0.01, le=5.0)
     max_retries: int = Field(2, ge=0, le=2)
     hour_of_day: int = Field(12, ge=0, le=23)
@@ -186,6 +189,7 @@ def assign(req: AssignmentIn):
             objective=req.directive.objective,
             feedback=[item.model_dump() for item in req.feedback],
             max_assets=req.max_assets,
+            priority=req.priority,
             det_budget_s=req.det_budget_s,
             max_retries=req.max_retries,
             hour_of_day=req.hour_of_day,
