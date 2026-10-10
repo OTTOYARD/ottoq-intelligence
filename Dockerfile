@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /srv
-ARG OTTOQ_CORE_REF=63a4c74b3f17daab08a0b9a55e76187dc8b27b78
+ARG OTTOQ_CORE_REF=da6fd6d080799a12baa55dcfb89bc33323ff031f
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
