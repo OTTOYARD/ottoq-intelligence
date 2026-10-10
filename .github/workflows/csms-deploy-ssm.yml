@@ -1,0 +1,85 @@
+# csms-deploy-ssm — put OTTO-Q's charger back end on this repository's box, over AWS Systems Manager.
+#
+# THE BACK END IS otto-q-core's, NOT THIS REPOSITORY'S. otto-q-core's csms/ holds an OCPP 2.0.1 charger back end (a
+# CSMS) and the bridge that replays the twin's charger messages to it, reading them through otto-q-core's
+# `ottoq-csms-relay` edge function with a source key of its own (otto-q-core migration 0697). It runs here, beside the
+# intelligence service, because this box already exists, is SSM-managed, and this repository already holds the AWS
+# credentials that reach it, so no credential is added anywhere. The work is otto-q-core's own script,
+# csms/deploy/deploy_ssm.py, at a full commit id given by hand; this workflow gives it a runner and the credentials.
+#
+# BY HAND ONLY. Nothing here runs on a push. Modes:
+#   discover  read only: the box's CPUs, load and free memory, its containers, and whether the back end's key exists.
+#   make-key  makes the back end's key ON THE BOX if it has none (/etc/ottoq-csms/key, mode 0400, owned by the
+#             container's user) and prints its SHA-256 and 14-character prefix. A person registers those in
+#             otto-q-core with public.ottoq_register_source_key_hash (migration 0697). The key never leaves the box
+#             and is never printed; this repository is public, and so are its run logs.
+#   deploy    ships csms/, builds its image and runs it: --cpus 0.25 --memory 256m, read-only root, no published port
+#             (the back end listens on the container's loopback for the bridge beside it), outbound HTTPS to the relay.
+#             Refuses unless the key exists.
+#   stop      removes the container. The twin does not depend on it.
+#
+# ONE DOCKER BUILD ON THE BOX AT A TIME: the same concurrency group as aws-deploy-ssm, never cancelled in progress.
+
+name: csms-deploy-ssm
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "discover (read only) | make-key | deploy | stop"
+        required: true
+        default: discover
+        type: choice
+        options: [discover, make-key, deploy, stop]
+      core_ref:
+        description: "otto-q-core commit whose csms/ runs: a full 40-character commit id"
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-intelligence
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  csms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      MODE: ${{ inputs.mode }}
+      CORE_REF: ${{ inputs.core_ref }}
+    steps:
+      - name: Refuse a core ref that is not a full commit id
+        # A branch or tag can move between the time a person reads it and the time this runs; a commit id cannot.
+        run: |
+          [[ "${CORE_REF}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::core_ref must be a full 40-character commit id"; exit 1; }
+
+      - name: Check out otto-q-core at that commit
+        uses: actions/checkout@v4
+        with:
+          repository: OTTOYARD/otto-q-core
+          ref: ${{ inputs.core_ref }}
+          path: otto-q-core
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3==1.40.40
+
+      - name: Check the credentials, and mask the account id
+        run: |
+          acct="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${acct}"
+
+      - name: Run csms/deploy/deploy_ssm.py
+        # The script refuses unless exactly one instance named ottoq-intel-2 is running and SSM reports it Online.
+        run: python3 -I otto-q-core/csms/deploy/deploy_ssm.py "${MODE}"
