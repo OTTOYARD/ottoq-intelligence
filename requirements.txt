@@ -1,7 +1,7 @@
 fastapi>=0.111
 uvicorn[standard]>=0.30
 pydantic>=2.7
-pulp>=2.8          # LP/MILP modeling; ships CBC, prefers HiGHS if present
+pulp==3.3.2        # LP/MILP modeling; ships CBC, prefers HiGHS if present. PINNED, see below.
 numpy>=1.26
 ortools==9.15.6755  # must match otto-q-core's reproducibility pin
 #
@@ -43,3 +43,16 @@ ortools==9.15.6755  # must match otto-q-core's reproducibility pin
 # process, no shared library, no ABI to collide. Never the wheel, in this image.
 # FR-2 (GPU tier): neuralforecast, torch  — installed in the GPU image only
 # FR-3 specialization: cuOpt client / requests  |  FR-4: openai-compatible NIM client
+#
+# ══ PuLP IS PINNED BELOW 4, AND THE NEXT IMAGE BUILD WOULD HAVE BROKEN THE ENERGY MPC WITHOUT IT ══════════
+#
+# `pulp>=2.8` let every build take the newest PuLP. PuLP 4.0.0 shipped 2026-09-25 and 4.0.1 2026-10-14
+# (https://pypi.org/pypi/pulp/json, read 2026-10-17), and 4.0 is not a compatible release: its core is
+# rewritten in Rust, so an LpVariable can only be created by the model (LpVariable.__init__ takes one
+# internal `_var`; `pulp.LpVariable("dis_0", 0, 1500)` raises TypeError, and so does lowBound=), and the
+# bundled CBC is gone (3.3.2 warns "PULP_CBC_CMD is deprecated and will be removed in PuLP 4.0"). With
+# highspy deliberately absent (above), PuLP 4 would leave _pick_solver() nothing to pick. Measured
+# 2026-10-17 on this checkout: PuLP 4.0.1 fails test collection (tests/test_real_wave_counterfactual.py,
+# TypeError in energy_mpc.optimize_energy); PuLP 3.3.2 passes all 47 tests. Porting to 4.0's model API
+# (prob.add_variable) is a separate change, to be measured like the CBC/HiGHS comparison above.
+
