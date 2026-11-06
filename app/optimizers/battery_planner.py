@@ -37,7 +37,6 @@ without it. No vehicle is ever held for it.
 """
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -71,7 +70,7 @@ class PlanResult:
     grid_kw: List[float]
     soc_kwh: List[float]            # energy at the start of each step, and at the end (len = steps + 1)
     peak_kw: List[float]            # each billing period's planned peak (periods wholly past omitted)
-    objective_usd: float
+    objective_usd: Optional[float]  # None when no plan was found (status says why): JSON has no NaN
     solver: str
     solve_ms: float
     detail: dict = field(default_factory=dict)
@@ -154,7 +153,8 @@ def plan_battery(
              pywraplp.Solver.ABNORMAL: "abnormal", pywraplp.Solver.NOT_SOLVED: "not_solved"}
     status = names.get(st, f"status_{st}")
     if st not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-        return PlanResult(status, [], [], [], [], math.nan, "glop", ms)
+        # e.g. a reserve floor the battery cannot reach in time: no plan, said plainly (the caller falls back)
+        return PlanResult(status, [], [], [], [], None, "glop", ms, detail={"steps": m, "e0_kwh": e0})
     return PlanResult(
         status=status,
         setpoint_kw=[dis[j].solution_value() - ch[j].solution_value() for j in range(m)],

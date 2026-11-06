@@ -151,3 +151,14 @@ def _kw(inp):
                 periods=[Period(**p) for p in inp["periods"]], past_grid_kw=inp["past_grid_kw"],
                 window_steps=inp["window_steps"], soc_floor_kwh=inp["soc_floor_kwh"],
                 wear_usd_kwh=inp["wear_usd_kwh"], terminal_usd_kwh=inp["terminal_usd_kwh"])
+
+
+def test_an_unreachable_floor_is_reported_not_crashed():
+    """A reserve floor the battery cannot reach in time leaves no plan: the status says so and the answer is valid JSON
+    (the lab's end-to-end days, 2026-11-06: three such plans became HTTP 500s on a NaN objective)."""
+    import json as _json
+    res = plan_battery([200.0] * 12, [0.06] * 12, 5.0, Battery(465, 300, 2850, 1500, 1500, 0.98), demand_usd_kw=0.71,
+                       periods=[Period(0, 12)], window_steps=6, soc_floor_kwh=[300.0, 300.0] + [912.0] * 10)
+    assert res.status == "infeasible"
+    assert res.objective_usd is None and res.setpoint_kw == []
+    _json.dumps(res.__dict__, allow_nan=False)
