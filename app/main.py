@@ -5,6 +5,7 @@ A hosted (AWS) FastAPI service the twin/edge-functions call for real optimizatio
 and learned inference that cannot live in Postgres:
 
     POST /optimize/energy   rolling-horizon BESS+charge MPC (FR-1)         [LIVE]
+    POST /optimize/battery-plan  the battery planner the research lab measured (B1)  [NEW]
     POST /forecast          probabilistic arrivals/load/SoC (FR-2)        [stub -> GPU model]
     POST /assign            deterministic CP-SAT assignment (FR-3)        [LIVE]
     POST /orchestrate       Nemotron conductor over the stack (FR-4)      [stub -> NIM]
@@ -23,6 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.optimizers.energy_mpc import BessState, optimize_energy
+from app.optimizers.battery_planner import Battery, Period, plan_battery
 from app.optimizers.assignment_cpsat import optimize_assignment
 from app.forecasters.priors import load_priors
 from app.forecasters.statistical import forecast
@@ -90,7 +92,8 @@ class EnergyOptIn(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "ottoq-intelligence", "optimizers": ["energy_mpc", "cp_sat_forward_lex"]}
+    return {"ok": True, "service": "ottoq-intelligence",
+            "optimizers": ["energy_mpc", "cp_sat_forward_lex", "battery_planner"]}
 
 
 @app.post("/optimize/energy", dependencies=[Depends(require_token)])
@@ -109,6 +112,63 @@ def optimize_energy_endpoint(req: EnergyOptIn):
         grid_cap_kw=req.grid_cap_kw,
         dr_penalty_usd_per_kwh=req.dr_penalty_usd_per_kwh,
     )
+    return res.__dict__
+
+
+class PlanBatteryIn(BaseModel):
+    soc_kwh: float
+    floor_kwh: float
+    ceiling_kwh: float
+    max_charge_kw: float = Field(..., ge=0)
+    max_discharge_kw: float = Field(..., ge=0)
+    eff_one_way: float = Field(..., gt=0, le=1)
+
+
+class PlanPeriodIn(BaseModel):
+    start: int
+    end: int
+    sunk_kw: float = Field(0.0, ge=0)
+    margin_kw: float = Field(0.0, ge=0)
+
+
+class BatteryPlanIn(BaseModel):
+    """The battery planner's request (otto-q-core builds it from the depot's learned forecast, 0803/0804)."""
+    load_kw: List[float] = Field(..., min_length=1, max_length=2000,
+                                 description="the site before the battery per step: building + EV - sun (may be negative)")
+    price_usd_kwh: List[float] = Field(..., min_length=1, max_length=2000)
+    step_min: float = Field(5.0, gt=0, le=60)
+    battery: PlanBatteryIn
+    demand_usd_kw: float = Field(..., ge=0, description="per kW of each billing period's highest window")
+    periods: List[PlanPeriodIn] = Field(..., min_length=1, max_length=8)
+    past_grid_kw: Optional[List[float]] = Field(None, max_length=120)
+    window_steps: int = Field(6, ge=1, le=120)
+    soc_floor_kwh: Optional[List[float]] = Field(None, max_length=2000)
+    wear_usd_kwh: float = Field(0.02, ge=0)
+    terminal_usd_kwh: float = Field(0.0, ge=0)
+    step_cap: bool = Field(False, description="no step of a billing period draws more than the period's peak")
+
+
+@app.post("/optimize/battery-plan", dependencies=[Depends(require_token)])
+def battery_plan_endpoint(req: BatteryPlanIn):
+    """The battery's plan over the horizon (app/optimizers/battery_planner.py). Advisory: the depot follows it only while
+    fresh and never during a demand-response call, inside its own limits; it moves only the battery."""
+    try:
+        res = plan_battery(
+            load_kw=req.load_kw,
+            price_usd_kwh=req.price_usd_kwh,
+            step_min=req.step_min,
+            battery=Battery(**req.battery.model_dump()),
+            demand_usd_kw=req.demand_usd_kw,
+            periods=[Period(**p.model_dump()) for p in req.periods],
+            past_grid_kw=req.past_grid_kw,
+            window_steps=req.window_steps,
+            soc_floor_kwh=req.soc_floor_kwh,
+            wear_usd_kwh=req.wear_usd_kwh,
+            terminal_usd_kwh=req.terminal_usd_kwh,
+            step_cap=req.step_cap,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return res.__dict__
 
 

@@ -23,6 +23,7 @@ Two founder rules this service must never violate:
 | Layer | Endpoint | Engine | Status |
 |---|---|---|---|
 | Optimize — Energy | `POST /optimize/energy` | rolling-horizon MILP/MPC (HiGHS) | **LIVE + tested** |
+| Optimize — Battery plan | `POST /optimize/battery-plan` | the research lab's battery LP (OR-Tools GLOP, the CP-SAT pin), per-step reserve floor, 30-minute billing windows with the past, terminal value | **NEW + tested** (lab parity) |
 | Forecast | `POST /forecast` | probabilistic arrivals/load/SoC | stub |
 | Optimize — Assign | `POST /assign` | NVIDIA cuOpt + job-shop | stub |
 | Orchestrate | `POST /orchestrate` | Nemotron conductor | stub |
