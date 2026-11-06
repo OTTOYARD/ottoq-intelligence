@@ -145,6 +145,7 @@ class BatteryPlanIn(BaseModel):
     soc_floor_kwh: Optional[List[float]] = Field(None, max_length=2000)
     wear_usd_kwh: float = Field(0.02, ge=0)
     terminal_usd_kwh: float = Field(0.0, ge=0)
+    step_cap: bool = Field(False, description="no step of a billing period draws more than the period's peak")
 
 
 @app.post("/optimize/battery-plan", dependencies=[Depends(require_token)])
@@ -164,6 +165,7 @@ def battery_plan_endpoint(req: BatteryPlanIn):
             soc_floor_kwh=req.soc_floor_kwh,
             wear_usd_kwh=req.wear_usd_kwh,
             terminal_usd_kwh=req.terminal_usd_kwh,
+            step_cap=req.step_cap,
         )
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

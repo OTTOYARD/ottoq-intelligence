@@ -122,3 +122,32 @@ def test_the_endpoint_returns_the_plan():
     with pytest.raises(HTTPException) as e:
         m.battery_plan_endpoint(m.BatteryPlanIn(**bad))
     assert e.value.status_code == 422
+
+
+def test_step_cap_keeps_every_step_under_the_peak():
+    """step_cap (production's request sets it): no step of a period draws more than the period's peak, so a plan followed
+    a few steps late cannot stack charging bursts in one half hour (the lab's late-landing days, 2026-11-06)."""
+    load = [300.0] * 48 + [900.0] * 12 + [300.0] * 36       # an evening wave the battery must be charged for
+    kw = dict(price_usd_kwh=[0.06] * 96, step_min=5.0, battery=Battery(400, 300, 2700, 1500, 1500, 0.98),
+              demand_usd_kw=0.71, periods=[Period(0, 96)], window_steps=6, wear_usd_kwh=0.02, terminal_usd_kwh=0.07)
+    free = plan_battery(load, **kw)
+    capped = plan_battery(load, step_cap=True, **kw)
+    assert free.status == capped.status == "optimal"
+    assert max(free.grid_kw) > free.peak_kw[0] + 1           # uncapped, the plan charges in bursts above its peak
+    assert max(capped.grid_kw) <= capped.peak_kw[0] + 1e-6   # capped, never above it
+    assert capped.peak_kw[0] <= 900 - 1                       # and the wave is still shaved
+    assert capped.objective_usd >= free.objective_usd - 1e-6  # a constraint can only cost
+
+
+def test_step_cap_off_is_the_labs_plan():
+    fx = _load(150)
+    res = plan_battery(step_cap=False, **{k: v for k, v in _kw(fx["inputs"]).items()})
+    assert res.objective_usd == pytest.approx(fx["lab"]["objective_usd"], rel=1e-9, abs=1e-6)
+
+
+def _kw(inp):
+    return dict(load_kw=inp["load_kw"], price_usd_kwh=inp["price_usd_kwh"], step_min=inp["step_min"],
+                battery=Battery(**inp["battery"]), demand_usd_kw=inp["demand_usd_kw"],
+                periods=[Period(**p) for p in inp["periods"]], past_grid_kw=inp["past_grid_kw"],
+                window_steps=inp["window_steps"], soc_floor_kwh=inp["soc_floor_kwh"],
+                wear_usd_kwh=inp["wear_usd_kwh"], terminal_usd_kwh=inp["terminal_usd_kwh"])

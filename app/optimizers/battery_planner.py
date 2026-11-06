@@ -24,6 +24,12 @@ The margin is the lab's guard: a half hour wholly in the future is planned to st
 (the lab's first day, planned to the edge on a forecast 250-400 kW low, ratcheted its billed peak from 1,128 to 1,457
 kW). The other guard (the next window never forecast under what the site drew last) belongs to whoever writes load_kw.
 
+step_cap (production's request sets it): no step of a billing period draws more than the period's peak. The objective
+bills 30-minute averages, so without it the plan is free to charge in full-power bursts inside a half hour; when the
+depot follows a plan a few steps late (a plan follows the step its clock is in), bursts from successive plans stack in
+the same half hour. The research lab measured it (2026-11-06): with every answer landing two ticks late, the billed
+half hour rose to 1,135-1,171 kW at midday, above the day plan's.
+
 ADVISORY, like everything this service returns. The plan reaches the depot as ottoq_energy_plan rows that the energy
 orchestrator follows only while fresh and never during a demand-response call (otto-q-core 0799), inside its own limits
 (the battery's power, floor, ceiling and temperature). It moves only the battery: the cars charge exactly as they would
@@ -83,6 +89,7 @@ def plan_battery(
     soc_floor_kwh: Optional[List[float]] = None,
     wear_usd_kwh: float = 0.02,
     terminal_usd_kwh: float = 0.0,
+    step_cap: bool = False,
 ) -> PlanResult:
     m = len(load_kw)
     if m == 0:
@@ -132,6 +139,9 @@ def plan_battery(
             margin = p.margin_kw if i0 >= 0 else 0.0
             s.Add(pk - margin >= (past_sum + sum(fut)) * (1.0 / win))
         s.Add(pk >= p.sunk_kw)
+        if step_cap:     # no step of the period draws more than its peak: a plan followed late cannot stack bursts
+            for j in range(max(p.start, 0), min(p.end, m)):
+                s.Add(g[j] <= pk)
         peaks.append(pk)
     s.Minimize(sum(price_usd_kwh[j] * g[j] * dt for j in range(m))
                + demand_usd_kw * sum(peaks)
