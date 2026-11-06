@@ -109,21 +109,16 @@ def test_bad_requests_are_refused():
 
 
 def test_the_endpoint_returns_the_plan():
-    os.environ["OTTOQ_ALLOW_UNAUTHENTICATED"] = "1"
-    try:
-        import importlib
-        import app.main as m
-        importlib.reload(m)
-        from fastapi.testclient import TestClient
-        inp = _load(300)["inputs"]
-        r = TestClient(m.app).post("/optimize/battery-plan", json=inp)
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["status"] == "optimal"
-        assert len(body["setpoint_kw"]) == len(inp["load_kw"])
-        assert body["objective_usd"] == pytest.approx(_load(300)["lab"]["objective_usd"], rel=1e-9, abs=1e-6)
-        assert "battery_planner" in TestClient(m.app).get("/health").json()["optimizers"]
-        bad = dict(inp, price_usd_kwh=inp["price_usd_kwh"][:-1])
-        assert TestClient(m.app).post("/optimize/battery-plan", json=bad).status_code == 422
-    finally:
-        os.environ.pop("OTTOQ_ALLOW_UNAUTHENTICATED", None)
+    """The route's own function (no HTTP client: the suite installs only requirements.txt and pytest)."""
+    from fastapi import HTTPException
+    import app.main as m
+    fx = _load(300)
+    body = m.battery_plan_endpoint(m.BatteryPlanIn(**fx["inputs"]))
+    assert body["status"] == "optimal"
+    assert len(body["setpoint_kw"]) == len(fx["inputs"]["load_kw"])
+    assert body["objective_usd"] == pytest.approx(fx["lab"]["objective_usd"], rel=1e-9, abs=1e-6)
+    assert "battery_planner" in m.health()["optimizers"]
+    bad = dict(fx["inputs"], price_usd_kwh=fx["inputs"]["price_usd_kwh"][:-1])
+    with pytest.raises(HTTPException) as e:
+        m.battery_plan_endpoint(m.BatteryPlanIn(**bad))
+    assert e.value.status_code == 422
